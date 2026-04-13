@@ -10,6 +10,8 @@ pub trait TaskSandbox {
 
 pub struct ProcessSandbox {
     pub downloader: ArtifactDownloader,
+    pub command: String,
+    pub entrypoint: String,
 }
 
 #[async_trait::async_trait]
@@ -40,9 +42,9 @@ impl TaskSandbox for ProcessSandbox {
         // Spawn the binary/script using tokio Command so we don't block
         // For security, true sandboxes use unshare/cgroups. Here we just run natively.
         // It's assumed the entrypoint is a valid script in the unpacked cache
-        let entrypoint = cache_dir.join("main.py");
+        let entrypoint = cache_dir.join(&self.entrypoint);
 
-        let output = Command::new("python3")
+        let output = Command::new(&self.command)
             .arg(entrypoint)
             .current_dir(&cache_dir) // Execute inside the cache root (or better, copy to run_dir for safety)
             .env("TASK_WORKSPACE", &run_dir)

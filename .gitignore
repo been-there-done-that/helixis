@@ -1,3 +1,4 @@
 /target
 .env
 demo/*.tar.gz
+examples/*.tar.gz

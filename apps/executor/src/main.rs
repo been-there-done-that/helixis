@@ -27,7 +27,10 @@ async fn main() {
         "artifacts",
     );
 
-    let sandbox = ProcessSandbox { downloader };
+    let command = std::env::var("EXECUTOR_COMMAND").unwrap_or_else(|_| "python3".to_string());
+    let entrypoint = std::env::var("EXECUTOR_ENTRYPOINT").unwrap_or_else(|_| "main.py".to_string());
+    let sandbox = ProcessSandbox { downloader, command, entrypoint };
+    
     let env_pack_id =
         std::env::var("RUNTIME_PACK_ID").unwrap_or_else(|_| "demo-python-pack".to_string());
     let runtime_pack_id = env_pack_id.as_str();
