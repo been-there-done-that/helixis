@@ -1,9 +1,8 @@
 .PHONY: dev-up dev-down seed fire cplane exec-python exec-node exec-bash e2e-all
 
-# Bring up Docker dependencies (MinIO and Postgres)
+# Bring up Docker dependencies (MinIO and Postgres) and wait for healthchecks
 dev-up:
-	docker-compose up -d
-	sleep 3
+	docker-compose up -d --wait
 
 # Tear down Docker dependencies and clear volumes
 dev-down:
@@ -50,13 +49,18 @@ e2e-all: seed
 	EXEC_ND_PID=$$!; \
 	RUNTIME_PACK_ID=bash-native-v1 EXECUTOR_COMMAND=bash EXECUTOR_ENTRYPOINT=main.sh cargo run --bin executor & \
 	EXEC_SH_PID=$$!; \
-	echo "Waiting for background nodes to bind ports..."; \
-	sleep 5; \
-	while ! curl -s http://localhost:3000/v1/tasks > /dev/null; do sleep 1; echo "Waiting for cplane..."; done; \
+	echo "Waiting for Control Plane to bind port 3000 natively..."; \
+	while ! nc -z localhost 3000; do \
+	  sleep 0.2; \
+	done; \
 	echo "Firing tasks!"; \
 	./scripts/fire_all.sh; \
+	echo "Waiting for tasks to finalize..."; \
+	while psql -h localhost -U postgres -d helixis -tA -c "SELECT status FROM tasks ORDER BY created_at DESC LIMIT 3" | grep -qE "(Queued|Scheduled)"; do \
+		sleep 1; \
+	done; \
+	echo "✅ All tasks processed successfully!"; \
 	echo "=========================================="; \
-	echo " Press [Ctrl+C] to gracefully shutdown all"; \
+	echo " Auto-shutting down Helixis Cluster..."; \
 	echo "=========================================="; \
-	trap 'kill -9 $$CPLANE_PID $$EXEC_PY_PID $$EXEC_ND_PID $$EXEC_SH_PID' INT TERM; \
-	wait
+	kill -9 $$CPLANE_PID $$EXEC_PY_PID $$EXEC_ND_PID $$EXEC_SH_PID

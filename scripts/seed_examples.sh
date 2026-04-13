@@ -3,8 +3,8 @@ set -e
 
 echo "--- [Helixis Multi-Language Seed] ---"
 echo "[1] Establishing Buckets..."
-export MC_HOST_myminio=http://minioadmin:minioadmin@127.0.0.1:9000
-docker run --rm --network host minio/mc mb myminio/artifacts || true
+docker exec helixis-minio-1 mc alias set myminio http://127.0.0.1:9000 minioadmin minioadmin
+docker exec helixis-minio-1 mc mb myminio/artifacts || true
 
 echo "[2] Seeding Base Tenant & Runtime Packs..."
 export PGPASSWORD=postgres
@@ -30,7 +30,8 @@ upload_artifact() {
     tar -czvf "examples/${PATH_NAME}.tar.gz" -C "examples/${PATH_NAME}" $ENTRY > /dev/null
     
     echo " -> Pushing $UUID to MinIO..."
-    docker run --rm -v $(pwd)/examples:/mnt --network host minio/mc cp "/mnt/${PATH_NAME}.tar.gz" myminio/artifacts/$UUID > /dev/null
+    docker cp "examples/${PATH_NAME}.tar.gz" "helixis-minio-1:/tmp/${PATH_NAME}.tar.gz"
+    docker exec helixis-minio-1 mc cp "/tmp/${PATH_NAME}.tar.gz" "myminio/artifacts/$UUID" > /dev/null
     
     echo " -> Mapping DB reference..."
     psql -h localhost -U postgres -d helixis -c "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ('$UUID', '00000000-0000-0000-0000-000000000001', 'hash-$UUID', '$RUNTIME_PACK', '$ENTRY', 1024) ON CONFLICT DO NOTHING;" > /dev/null
