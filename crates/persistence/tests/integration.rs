@@ -1,4 +1,4 @@
-use application::ports::repositories::{ExecutorRepository, TaskRepository};
+use application::ports::repositories::{ExecutorRepository, TaskRepository, RepositoryError};
 use domain::{Artifact, Executor, RuntimePack, Task, TaskStatus};
 use persistence::{
     db,
@@ -9,7 +9,6 @@ use std::env;
 use uuid::Uuid;
 
 async fn setup_db() -> PgPool {
-    // Try dotenv, ignore if not found
     let _ = dotenvy::dotenv();
     let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/helixis".into());
     db::create_pool(&db_url).await.expect("Failed to connect to pool")
@@ -18,7 +17,7 @@ async fn setup_db() -> PgPool {
 async fn insert_prereqs(pool: &PgPool) -> (Uuid, Uuid, String) {
     let tenant_id = Uuid::new_v4();
     let artifact_id = Uuid::new_v4();
-    let runtime_pack_id = "python-3.11-v1".to_string();
+    let runtime_pack_id = format!("python-3.11-v1-{}", Uuid::new_v4()); // Ensure uniqueness per test if run concurrently
 
     sqlx::query!(
         "INSERT INTO tenants (id, name) VALUES ($1, 'Test Tenant')",
@@ -37,8 +36,8 @@ async fn insert_prereqs(pool: &PgPool) -> (Uuid, Uuid, String) {
     .unwrap();
 
     sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, 'sha256:dummy', $3, 'main.py', 100)",
-        artifact_id, tenant_id, runtime_pack_id
+        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
+        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack_id
     )
     .execute(pool)
     .await
@@ -78,6 +77,10 @@ async fn test_insert_and_poll() {
 
     task_repo.insert_task(&task).await.unwrap();
 
+    // Verify task fetch
+    let fetched = task_repo.get_task(task_id).await.unwrap();
+    assert_eq!(fetched.id, task_id);
+
     // Poll the task
     let (polled_task, lease) = task_repo
         .poll_and_lease(&runtime_pack_id, executor.id, 60)
@@ -96,4 +99,27 @@ async fn test_insert_and_poll() {
         .await
         .unwrap();
     assert!(empty_poll.is_none());
+}
+
+#[tokio::test]
+async fn test_executor_heartbeat() {
+    let pool = setup_db().await;
+    let repo = PostgresExecutorRepository::new(pool.clone());
+
+    let executor = Executor {
+        id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+    };
+
+    repo.upsert_executor(&executor).await.expect("Failed to upsert executor");
+    repo.record_heartbeat(executor.id).await.expect("Failed to record heartbeat");
+}
+
+#[tokio::test]
+async fn test_get_not_found() {
+    let pool = setup_db().await;
+    let repo = PostgresTaskRepository::new(pool.clone());
+
+    let res = repo.get_task(Uuid::new_v4()).await;
+    assert!(matches!(res, Err(RepositoryError::NotFound)));
 }
