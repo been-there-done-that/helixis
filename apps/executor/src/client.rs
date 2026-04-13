@@ -42,7 +42,13 @@ impl CplaneClient {
             lease_duration_sec,
         };
 
-        let response = self.client.post(url).json(&req).send().await?;
+        let response = self
+            .client
+            .post(url)
+            .json(&req)
+            .send()
+            .await?
+            .error_for_status()?;
 
         let poll_response: PollResponse = response.json().await?;
 
@@ -53,7 +59,12 @@ impl CplaneClient {
         }
     }
 
-    pub async fn report_status(&self, task_id: Uuid, status: &str) -> Result<(), ClientError> {
+    pub async fn report_status(
+        &self,
+        task_id: Uuid,
+        lease_id: Uuid,
+        status: &str,
+    ) -> Result<(), ClientError> {
         let url = self
             .base_url
             .join(&format!("/v1/tasks/{}/status", task_id))
@@ -63,9 +74,16 @@ impl CplaneClient {
 
         let req = TaskStatusUpdateRequest {
             status: status.to_string(),
+            lease_id,
+            executor_id: self.executor_id,
         };
 
-        self.client.post(url).json(&req).send().await?;
+        self.client
+            .post(url)
+            .json(&req)
+            .send()
+            .await?
+            .error_for_status()?;
 
         Ok(())
     }

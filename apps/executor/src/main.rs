@@ -46,7 +46,7 @@ async fn main() {
         tracing::debug!("Polling queue...");
 
         match client.poll_task(runtime_pack_id, 120).await {
-            Ok(Some((task, _lease))) => {
+            Ok(Some((task, lease))) => {
                 consecutive_empty_polls = 0;
                 tracing::info!("Acquired task {}! Executing now...", task.id);
 
@@ -54,13 +54,14 @@ async fn main() {
                 match sandbox.execute(&task).await {
                     Ok(_) => {
                         tracing::info!("Execution Succeeded. Reporting status to cplane...");
-                        if let Err(e) = client.report_status(task.id, "Succeeded").await {
+                        if let Err(e) = client.report_status(task.id, lease.id, "Succeeded").await
+                        {
                             tracing::error!("Failed to report Succeeded status: {}", e);
                         }
                     }
                     Err(e) => {
                         tracing::error!("Execution Failed: {}. Reporting status to cplane...", e);
-                        if let Err(err) = client.report_status(task.id, "Failed").await {
+                        if let Err(err) = client.report_status(task.id, lease.id, "Failed").await {
                             tracing::error!("Failed to report Failed status: {}", err);
                         }
                     }

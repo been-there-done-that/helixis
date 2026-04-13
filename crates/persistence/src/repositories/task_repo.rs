@@ -67,11 +67,62 @@ impl TaskRepository for PostgresTaskRepository {
             TaskStatus::DeadLetter => "DeadLetter",
         };
 
-        sqlx::query!(
-            "INSERT INTO tasks (id, tenant_id, artifact_id, runtime_pack_id, status, priority, rate_limit_key, timeout_seconds, max_attempts, current_attempt, idempotency_key)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-             task.id, task.tenant_id, task.artifact_id, task.runtime_pack_id, status_str, task.priority, task.rate_limit_key, task.timeout_seconds, task.max_attempts, task.current_attempt, task.idempotency_key
-        ).execute(&self.pool).await.map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+        let result = sqlx::query!(
+            r#"
+            INSERT INTO tasks (
+                id,
+                tenant_id,
+                artifact_id,
+                runtime_pack_id,
+                status,
+                priority,
+                rate_limit_key,
+                timeout_seconds,
+                max_attempts,
+                current_attempt,
+                idempotency_key
+            )
+            SELECT
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6,
+                $7,
+                $8,
+                $9,
+                $10,
+                $11
+            WHERE EXISTS (
+                SELECT 1
+                FROM artifacts
+                WHERE id = $3
+                  AND tenant_id = $2
+                  AND runtime_pack_id = $4
+            )
+            "#,
+            task.id,
+            task.tenant_id,
+            task.artifact_id,
+            task.runtime_pack_id,
+            status_str,
+            task.priority,
+            task.rate_limit_key,
+            task.timeout_seconds,
+            task.max_attempts,
+            task.current_attempt,
+            task.idempotency_key
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::Conflict(
+                "artifact does not belong to tenant or runtime pack does not match".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -165,6 +216,8 @@ impl TaskRepository for PostgresTaskRepository {
     async fn update_task_status(
         &self,
         id: Uuid,
+        lease_id: Uuid,
+        executor_id: Uuid,
         status: TaskStatus,
     ) -> Result<(), RepositoryError> {
         let status_str = match status {
@@ -178,18 +231,34 @@ impl TaskRepository for PostgresTaskRepository {
             TaskStatus::DeadLetter => "DeadLetter",
         };
 
-        sqlx::query!(
+        let result = sqlx::query!(
             r#"
             UPDATE tasks
             SET status = $1, updated_at = NOW()
             WHERE id = $2
+              AND EXISTS (
+                  SELECT 1
+                  FROM task_leases
+                  WHERE id = $3
+                    AND task_id = $2
+                    AND executor_id = $4
+                    AND expires_at > NOW()
+              )
             "#,
             status_str,
-            id
+            id,
+            lease_id,
+            executor_id
         )
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::Conflict(
+                "no active lease matches this completion".to_string(),
+            ));
+        }
 
         Ok(())
     }

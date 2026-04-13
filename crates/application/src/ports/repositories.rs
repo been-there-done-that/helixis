@@ -8,15 +8,14 @@ pub enum RepositoryError {
     DatabaseError(String),
     #[error("Record not found")]
     NotFound,
+    #[error("Conflict: {0}")]
+    Conflict(String),
 }
 
 #[async_trait]
 pub trait TaskRepository: Send + Sync {
     async fn get_task(&self, id: Uuid) -> Result<Option<Task>, RepositoryError>;
 
-    // Updates the status of an existing task
-    async fn update_task_status(&self, id: Uuid, status: TaskStatus)
-    -> Result<(), RepositoryError>;
     async fn insert_task(&self, task: &Task) -> Result<(), RepositoryError>;
 
     /// Polling queue items natively
@@ -26,6 +25,14 @@ pub trait TaskRepository: Send + Sync {
         executor_id: Uuid,
         lease_duration_sec: i32,
     ) -> Result<Option<(Task, TaskLease)>, RepositoryError>;
+
+    async fn update_task_status(
+        &self,
+        id: Uuid,
+        lease_id: Uuid,
+        executor_id: Uuid,
+        status: TaskStatus,
+    ) -> Result<(), RepositoryError>;
 }
 
 #[async_trait]

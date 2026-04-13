@@ -41,6 +41,7 @@ impl From<RepositoryError> for ApiError {
         match err {
             RepositoryError::DatabaseError(msg) => ApiError::DatabaseError(msg),
             RepositoryError::NotFound => ApiError::NotFound,
+            RepositoryError::Conflict(msg) => ApiError::DatabaseError(msg),
         }
     }
 }
@@ -71,6 +72,14 @@ pub async fn submit_task(
                 status: task.status,
             };
             (StatusCode::CREATED, Json(response)).into_response()
+        }
+        Err(RepositoryError::Conflict(msg)) => {
+            tracing::warn!("Task submission rejected: {}", msg);
+            (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": msg })),
+            )
+                .into_response()
         }
         Err(e) => {
             tracing::error!("Database error: {:?}", e);
@@ -144,8 +153,13 @@ pub async fn update_task_status(
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    match state.task_repo.update_task_status(id, status).await {
+    match state
+        .task_repo
+        .update_task_status(id, payload.lease_id, payload.executor_id, status)
+        .await
+    {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(RepositoryError::Conflict(_)) => StatusCode::CONFLICT.into_response(),
         Err(e) => {
             tracing::error!("Database error during status update: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()

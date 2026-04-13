@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use object_store::aws::AmazonS3Builder;
 use object_store::{ObjectStore, path::Path as StorePath};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
 use uuid::Uuid;
@@ -12,6 +12,8 @@ pub enum ArtifactError {
     Store(#[from] object_store::Error),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Archive error: {0}")]
+    InvalidArchive(String),
 }
 
 pub struct ArtifactDownloader {
@@ -47,7 +49,7 @@ impl ArtifactDownloader {
         let object_key = format!("{}", artifact_id);
         let cache_dir = Path::new("/tmp/helixis/cache/artifacts").join(&object_key);
 
-        if cache_dir.exists() {
+        if fs::try_exists(&cache_dir).await? {
             tracing::debug!("Artifact {} found in cache. Warm start!", artifact_id);
             return Ok(cache_dir);
         }
@@ -63,11 +65,11 @@ impl ArtifactDownloader {
         let body = self.store.get(&path).await?;
         let bytes: Bytes = body.bytes().await?;
 
-        // Ensure cache directory exists
-        fs::create_dir_all(&cache_dir).await?;
+        let staging_dir = Path::new("/tmp/helixis/cache/artifacts")
+            .join(format!("{object_key}.staging-{}", Uuid::new_v4()));
+        fs::create_dir_all(&staging_dir).await?;
 
-        // Decompress logic inside thread blocking since tar unpacking is CPU bound
-        let dir_clone = cache_dir.clone();
+        let dir_clone = staging_dir.clone();
         tokio::task::spawn_blocking(move || {
             use flate2::read::GzDecoder;
             use std::io::Cursor;
@@ -75,10 +77,44 @@ impl ArtifactDownloader {
 
             let tar = GzDecoder::new(Cursor::new(bytes.to_vec()));
             let mut archive = Archive::new(tar);
-            archive.unpack(&dir_clone)
+
+            for entry in archive.entries()? {
+                let mut entry = entry?;
+                let path = entry.path()?.into_owned();
+
+                validate_archive_path(&path).map_err(std::io::Error::other)?;
+
+                let entry_type = entry.header().entry_type();
+                if entry_type.is_symlink() || entry_type.is_hard_link() {
+                    return Err(std::io::Error::other(format!(
+                        "unsupported archive entry type for {}",
+                        path.display()
+                    )));
+                }
+
+                if !entry.unpack_in(&dir_clone)? {
+                    return Err(std::io::Error::other(format!(
+                        "archive entry escaped extraction root: {}",
+                        path.display()
+                    )));
+                }
+            }
+
+            Ok::<(), std::io::Error>(())
         })
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))??;
+
+        match fs::rename(&staging_dir, &cache_dir).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_dir_all(&staging_dir).await;
+            }
+            Err(err) => {
+                let _ = fs::remove_dir_all(&staging_dir).await;
+                return Err(err.into());
+            }
+        }
 
         tracing::info!(
             "Successfully unpacked artifact {} to {:?}",
@@ -88,4 +124,20 @@ impl ArtifactDownloader {
 
         Ok(cache_dir)
     }
+}
+
+fn validate_archive_path(path: &Path) -> Result<(), ArtifactError> {
+    for component in path.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ArtifactError::InvalidArchive(format!(
+                    "refusing unsafe archive path {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }

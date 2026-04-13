@@ -10,7 +10,9 @@ use persistence::{
     db,
     repositories::{executor_repo::PostgresExecutorRepository, task_repo::PostgresTaskRepository},
 };
-use protocol::api::{PollRequest, PollResponse, TaskResponse, TaskSubmitRequest};
+use protocol::api::{
+    PollRequest, PollResponse, TaskResponse, TaskStatusUpdateRequest, TaskSubmitRequest,
+};
 use std::env;
 use std::sync::Arc;
 use tower::{Service, ServiceExt};
@@ -138,4 +140,78 @@ async fn test_full_api_flow() {
     assert!(body_json.lease.is_some());
     let lease = body_json.lease.unwrap();
     assert_eq!(lease.executor_id, executor.id);
+
+    let status_req = TaskStatusUpdateRequest {
+        status: "Succeeded".to_string(),
+        lease_id: lease.id,
+        executor_id: executor.id,
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/tasks/{task_id}/status"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&status_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn test_reject_mismatched_artifact_runtime() {
+    let pool = setup_db().await;
+    let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
+    let other_runtime_pack = format!("node-20-v1-api-{}", Uuid::new_v4());
+
+    sqlx::query!(
+        "INSERT INTO runtime_packs (id, language, language_version, sandbox_kind) VALUES ($1, 'node', '20', 'proc')",
+        other_runtime_pack
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let artifact_id = Uuid::new_v4();
+    sqlx::query!(
+        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
+        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let task_repo = Arc::new(PostgresTaskRepository::new(pool.clone()));
+    let state = Arc::new(AppState { task_repo });
+    let app = app_router(state);
+
+    let submit_req = TaskSubmitRequest {
+        tenant_id,
+        artifact_id,
+        runtime_pack_id: other_runtime_pack,
+        priority: Some(5),
+        rate_limit_key: None,
+        timeout_seconds: Some(100),
+        max_attempts: Some(2),
+        idempotency_key: None,
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&submit_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 }

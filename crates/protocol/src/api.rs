@@ -36,4 +36,6 @@ pub struct PollResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TaskStatusUpdateRequest {
     pub status: String,
+    pub lease_id: Uuid,
+    pub executor_id: Uuid,
 }
