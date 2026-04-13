@@ -15,3 +15,5 @@ domain = { path = "../../crates/domain" }
 reqwest = { version = "0.12", features = ["json"] }
 thiserror = { workspace = true }
 async-trait = "0.1"
+object_store = { workspace = true }
+bytes = { workspace = true }

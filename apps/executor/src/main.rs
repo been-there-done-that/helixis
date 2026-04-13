@@ -1,8 +1,10 @@
+mod artifact_client;
 mod client;
 mod sandbox;
 
+use artifact_client::ArtifactDownloader;
 use client::CplaneClient;
-use sandbox::{MockSandbox, TaskSandbox};
+use sandbox::{ProcessSandbox, TaskSandbox};
 use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -17,16 +19,26 @@ async fn main() {
     let client = CplaneClient::new("http://127.0.0.1:3000", executor_id)
         .expect("Failed to create control plane client");
         
-    let sandbox = MockSandbox;
+    let downloader = ArtifactDownloader::new(
+        "http://localhost:9000",
+        "minioadmin",
+        "minioadmin",
+        "artifacts"
+    );
+        
+    let sandbox = ProcessSandbox { downloader };
     let runtime_pack = "python-3.11-v1"; // The runtime pack this executor can handle
 
     tracing::info!("Polling for tasks matching runtime_pack: {}", runtime_pack);
+
+    let mut consecutive_empty_polls = 0;
 
     loop {
         tracing::debug!("Polling queue...");
         
         match client.poll_task(runtime_pack, 120).await {
             Ok(Some((task, _lease))) => {
+                consecutive_empty_polls = 0;
                 tracing::info!("Acquired task {}! Executing now...", task.id);
                 
                 // Execute mock task
@@ -36,12 +48,17 @@ async fn main() {
                 }
             }
             Ok(None) => {
-                tracing::trace!("Queue is empty. Sleeping 3 seconds...");
-                sleep(Duration::from_secs(3)).await;
+                consecutive_empty_polls += 1;
+                // Exponential backoff: 2, 4, 8, 16... max 30 seconds
+                let delay = std::cmp::min(1 << consecutive_empty_polls, 30);
+                tracing::trace!("Queue is empty. Sleeping {} seconds...", delay);
+                sleep(Duration::from_secs(delay as u64)).await;
             }
             Err(e) => {
-                tracing::error!("Failed to poll control plane: {}. Retrying in 5 seconds...", e);
-                sleep(Duration::from_secs(5)).await;
+                consecutive_empty_polls += 1;
+                let delay = std::cmp::min(1 << consecutive_empty_polls, 30);
+                tracing::error!("Failed to poll control plane: {}. Retrying in {} seconds...", e, delay);
+                sleep(Duration::from_secs(delay as u64)).await;
             }
         }
     }
