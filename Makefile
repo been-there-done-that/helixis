@@ -36,6 +36,10 @@ exec-bash:
 # The Ultimate End-to-End Test (Spins up everything, fires tasks, and cleans up on exit)
 e2e-all: seed
 	@echo "=========================================="
+	@echo " Compiling Control Plane and Executors"
+	@echo "=========================================="
+	cargo build
+	@echo "=========================================="
 	@echo " Starting Control Plane and Executor Pool"
 	@echo "=========================================="
 	@cargo run --bin cplane & \
@@ -46,8 +50,9 @@ e2e-all: seed
 	EXEC_ND_PID=$$!; \
 	RUNTIME_PACK_ID=bash-native-v1 EXECUTOR_COMMAND=bash EXECUTOR_ENTRYPOINT=main.sh cargo run --bin executor & \
 	EXEC_SH_PID=$$!; \
-	echo "Waiting for services to boot..."; \
-	sleep 7; \
+	echo "Waiting for background nodes to bind ports..."; \
+	sleep 5; \
+	while ! curl -s http://localhost:3000/v1/tasks > /dev/null; do sleep 1; echo "Waiting for cplane..."; done; \
 	echo "Firing tasks!"; \
 	./scripts/fire_all.sh; \
 	echo "=========================================="; \
