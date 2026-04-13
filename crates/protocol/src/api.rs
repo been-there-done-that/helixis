@@ -34,6 +34,18 @@ pub struct PollResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct RegisterExecutorRequest {
+    pub executor_id: Uuid,
+    pub session_id: Uuid,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HeartbeatRequest {
+    pub executor_id: Uuid,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TaskStatusUpdateRequest {
     pub status: String,
     pub lease_id: Uuid,

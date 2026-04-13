@@ -1,4 +1,4 @@
-use application::ports::repositories::{RepositoryError, TaskRepository};
+use application::ports::repositories::{ExecutorRepository, RepositoryError, TaskRepository};
 use axum::{
     Json,
     extract::{Path, State},
@@ -6,7 +6,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use protocol::api::{
-    PollRequest, PollResponse, TaskResponse, TaskStatusUpdateRequest, TaskSubmitRequest,
+    HeartbeatRequest, PollRequest, PollResponse, RegisterExecutorRequest, TaskResponse,
+    TaskStatusUpdateRequest, TaskSubmitRequest,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use uuid::Uuid;
 
 pub struct AppState {
     pub task_repo: Arc<dyn TaskRepository>,
+    pub executor_repo: Arc<dyn ExecutorRepository>,
 }
 
 pub enum ApiError {
@@ -135,8 +137,49 @@ pub async fn poll_tasks(
             };
             (StatusCode::OK, Json(response)).into_response()
         }
+        Err(RepositoryError::Conflict(msg)) => {
+            tracing::warn!("Poll rejected: {}", msg);
+            (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": msg })),
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::error!("Database error during poll: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn register_executor(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<RegisterExecutorRequest>,
+) -> impl IntoResponse {
+    let executor = domain::Executor {
+        id: payload.executor_id,
+        session_id: payload.session_id,
+        capabilities: payload.capabilities,
+    };
+
+    match state.executor_repo.upsert_executor(&executor).await {
+        Ok(_) => StatusCode::CREATED.into_response(),
+        Err(e) => {
+            tracing::error!("Database error during executor registration: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn heartbeat_executor(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<HeartbeatRequest>,
+) -> impl IntoResponse {
+    match state.executor_repo.record_heartbeat(payload.executor_id).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(RepositoryError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!("Database error during executor heartbeat: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -148,6 +191,7 @@ pub async fn update_task_status(
     Json(payload): Json<TaskStatusUpdateRequest>,
 ) -> impl IntoResponse {
     let status = match payload.status.as_str() {
+        "Running" => domain::TaskStatus::Running,
         "Succeeded" => domain::TaskStatus::Succeeded,
         "Failed" => domain::TaskStatus::Failed,
         _ => return StatusCode::BAD_REQUEST.into_response(),

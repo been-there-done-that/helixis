@@ -164,12 +164,20 @@ impl TaskRepository for PostgresTaskRepository {
 
         let task_id = row.id;
         let lease_id = Uuid::new_v4();
-
-        // Auto-stub the executor session to prevent foreign-key failures in absence of proper heartbeat phase
-        sqlx::query!(
-            "INSERT INTO executors (id, session_id, capabilities_json) VALUES ($1, gen_random_uuid(), '[]'::jsonb) ON CONFLICT (id) DO NOTHING",
+        let executor_exists = sqlx::query_scalar!(
+            "SELECT EXISTS (SELECT 1 FROM executors WHERE id = $1)",
             executor_id
-        ).execute(&mut *tx).await.map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?
+        .unwrap_or(false);
+
+        if !executor_exists {
+            return Err(RepositoryError::Conflict(
+                "executor must register before polling".to_string(),
+            ));
+        }
 
         // Use a simple string building approach for the interval
         let query_str = format!(
@@ -231,35 +239,215 @@ impl TaskRepository for PostgresTaskRepository {
             TaskStatus::DeadLetter => "DeadLetter",
         };
 
-        let result = sqlx::query!(
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+        let lease_exists = sqlx::query_scalar!(
             r#"
-            UPDATE tasks
-            SET status = $1, updated_at = NOW()
-            WHERE id = $2
-              AND EXISTS (
-                  SELECT 1
-                  FROM task_leases
-                  WHERE id = $3
-                    AND task_id = $2
-                    AND executor_id = $4
-                    AND expires_at > NOW()
-              )
+            SELECT EXISTS (
+                SELECT 1
+                FROM task_leases
+                WHERE id = $1
+                  AND task_id = $2
+                  AND executor_id = $3
+                  AND expires_at > NOW()
+            )
             "#,
-            status_str,
-            id,
             lease_id,
+            id,
             executor_id
         )
-        .execute(&self.pool)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?
+        .unwrap_or(false);
 
-        if result.rows_affected() == 0 {
+        if !lease_exists {
             return Err(RepositoryError::Conflict(
                 "no active lease matches this completion".to_string(),
             ));
         }
 
+        match status {
+            TaskStatus::Running => {
+                let result = sqlx::query!(
+                    r#"
+                    UPDATE tasks
+                    SET status = $1, current_attempt = current_attempt + 1, updated_at = NOW()
+                    WHERE id = $2
+                      AND status = 'Scheduled'
+                    "#,
+                    status_str,
+                    id
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+                if result.rows_affected() == 0 {
+                    let status_row = sqlx::query!("SELECT status FROM tasks WHERE id = $1", id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+                    let already_running = status_row
+                        .as_ref()
+                        .map(|row| row.status == "Running")
+                        .unwrap_or(false);
+
+                    if !already_running {
+                        return Err(RepositoryError::Conflict(
+                            "task is not schedulable for running".to_string(),
+                        ));
+                    }
+                }
+
+                sqlx::query!(
+                    r#"
+                    INSERT INTO task_attempts (id, task_id, executor_id, lease_id)
+                    SELECT $1, $2, $3, $4
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM task_attempts WHERE lease_id = $4
+                    )
+                    "#,
+                    Uuid::new_v4(),
+                    id,
+                    executor_id,
+                    lease_id
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+            }
+            TaskStatus::Succeeded
+            | TaskStatus::Failed
+            | TaskStatus::Cancelled
+            | TaskStatus::TimedOut
+            | TaskStatus::DeadLetter => {
+                let result = sqlx::query!(
+                    r#"
+                    UPDATE tasks
+                    SET status = $1, updated_at = NOW()
+                    WHERE id = $2
+                    "#,
+                    status_str,
+                    id
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+                if result.rows_affected() == 0 {
+                    return Err(RepositoryError::NotFound);
+                }
+
+                sqlx::query!(
+                    r#"
+                    UPDATE task_attempts
+                    SET finished_at = NOW(), exit_reason = $1
+                    WHERE lease_id = $2
+                      AND finished_at IS NULL
+                    "#,
+                    status_str,
+                    lease_id
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+                sqlx::query!("DELETE FROM task_leases WHERE id = $1", lease_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+            }
+            TaskStatus::Queued | TaskStatus::Scheduled => {
+                return Err(RepositoryError::Conflict(
+                    "unsupported external status transition".to_string(),
+                ));
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
         Ok(())
+    }
+
+    async fn requeue_expired_leases(&self) -> Result<u64, RepositoryError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+        let expired = sqlx::query!(
+            r#"
+            SELECT tl.id, tl.task_id, t.current_attempt, t.max_attempts
+            FROM task_leases tl
+            JOIN tasks t ON t.id = tl.task_id
+            WHERE tl.expires_at <= NOW()
+              AND t.status IN ('Scheduled', 'Running')
+            "#
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+        if expired.is_empty() {
+            tx.commit()
+                .await
+                .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+            return Ok(0);
+        }
+
+        for lease in &expired {
+            let next_status = if lease.current_attempt >= lease.max_attempts {
+                "DeadLetter"
+            } else {
+                "Queued"
+            };
+
+            sqlx::query!(
+                r#"
+                UPDATE tasks
+                SET status = $1, updated_at = NOW()
+                WHERE id = $2
+                "#,
+                next_status,
+                lease.task_id
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+            sqlx::query!(
+                r#"
+                UPDATE task_attempts
+                SET finished_at = NOW(), exit_reason = 'LeaseExpired'
+                WHERE lease_id = $1
+                  AND finished_at IS NULL
+                "#,
+                lease.id
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+        }
+
+        let lease_ids: Vec<Uuid> = expired.iter().map(|lease| lease.id).collect();
+        sqlx::query!("DELETE FROM task_leases WHERE id = ANY($1)", &lease_ids)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+        Ok(expired.len() as u64)
     }
 }

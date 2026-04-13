@@ -57,4 +57,5 @@ pub struct TaskLease {
 pub struct Executor {
     pub id: Uuid,
     pub session_id: Uuid,
+    pub capabilities: Vec<String>,
 }

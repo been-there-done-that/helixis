@@ -1,5 +1,5 @@
-use application::ports::repositories::{ExecutorRepository, RepositoryError, TaskRepository};
-use domain::{Artifact, Executor, RuntimePack, Task, TaskStatus};
+use application::ports::repositories::{ExecutorRepository, TaskRepository};
+use domain::{Executor, Task, TaskStatus};
 use persistence::{
     db,
     repositories::{executor_repo::PostgresExecutorRepository, task_repo::PostgresTaskRepository},
@@ -12,9 +12,14 @@ async fn setup_db() -> PgPool {
     let _ = dotenvy::dotenv();
     let db_url = env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/helixis".into());
-    db::create_pool(&db_url)
+    let pool = db::create_pool(&db_url)
         .await
-        .expect("Failed to connect to pool")
+        .expect("Failed to connect to pool");
+    sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .expect("Failed to run migrations");
+    pool
 }
 
 async fn insert_prereqs(pool: &PgPool) -> (Uuid, Uuid, String) {
@@ -60,6 +65,7 @@ async fn test_insert_and_poll() {
     let executor = Executor {
         id: Uuid::new_v4(),
         session_id: Uuid::new_v4(),
+        capabilities: vec![runtime_pack_id.clone()],
     };
     executor_repo.upsert_executor(&executor).await.unwrap();
 
@@ -112,6 +118,7 @@ async fn test_executor_heartbeat() {
     let executor = Executor {
         id: Uuid::new_v4(),
         session_id: Uuid::new_v4(),
+        capabilities: vec!["python-3.11".to_string()],
     };
 
     repo.upsert_executor(&executor)
@@ -129,4 +136,61 @@ async fn test_get_not_found() {
 
     let res = repo.get_task(Uuid::new_v4()).await.unwrap();
     assert!(res.is_none());
+}
+
+#[tokio::test]
+async fn test_requeue_expired_lease() {
+    let pool = setup_db().await;
+    let task_repo = PostgresTaskRepository::new(pool.clone());
+    let executor_repo = PostgresExecutorRepository::new(pool.clone());
+
+    let (tenant_id, artifact_id, runtime_pack_id) = insert_prereqs(&pool).await;
+
+    let executor = Executor {
+        id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+        capabilities: vec![runtime_pack_id.clone()],
+    };
+    executor_repo.upsert_executor(&executor).await.unwrap();
+
+    let task = Task {
+        id: Uuid::new_v4(),
+        tenant_id,
+        artifact_id,
+        runtime_pack_id: runtime_pack_id.clone(),
+        status: TaskStatus::Queued,
+        priority: 1,
+        rate_limit_key: None,
+        timeout_seconds: 60,
+        max_attempts: 3,
+        current_attempt: 0,
+        idempotency_key: None,
+    };
+
+    task_repo.insert_task(&task).await.unwrap();
+
+    let (_polled_task, lease) = task_repo
+        .poll_and_lease(&runtime_pack_id, executor.id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+
+    task_repo
+        .update_task_status(task.id, lease.id, executor.id, TaskStatus::Running)
+        .await
+        .unwrap();
+
+    sqlx::query!(
+        "UPDATE task_leases SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+        lease.id
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let requeued = task_repo.requeue_expired_leases().await.unwrap();
+    assert!(requeued >= 1);
+
+    let fetched = task_repo.get_task(task.id).await.unwrap().unwrap();
+    assert_eq!(fetched.status, TaskStatus::Queued);
 }

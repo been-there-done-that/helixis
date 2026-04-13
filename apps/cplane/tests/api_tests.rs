@@ -11,7 +11,8 @@ use persistence::{
     repositories::{executor_repo::PostgresExecutorRepository, task_repo::PostgresTaskRepository},
 };
 use protocol::api::{
-    PollRequest, PollResponse, TaskResponse, TaskStatusUpdateRequest, TaskSubmitRequest,
+    HeartbeatRequest, PollRequest, PollResponse, RegisterExecutorRequest, TaskResponse,
+    TaskStatusUpdateRequest, TaskSubmitRequest,
 };
 use std::env;
 use std::sync::Arc;
@@ -22,9 +23,14 @@ async fn setup_db() -> sqlx::PgPool {
     let _ = dotenvy::dotenv();
     let db_url = env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/helixis".into());
-    db::create_pool(&db_url)
+    let pool = db::create_pool(&db_url)
         .await
-        .expect("Failed to connect to pool")
+        .expect("Failed to connect to pool");
+    sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .expect("Failed to run migrations");
+    pool
 }
 
 async fn insert_prereqs(pool: &sqlx::PgPool) -> (Uuid, String) {
@@ -66,13 +72,17 @@ async fn test_full_api_flow() {
     .unwrap();
 
     let task_repo = Arc::new(PostgresTaskRepository::new(pool.clone()));
-    let executor_repo = PostgresExecutorRepository::new(pool.clone());
-    let state = Arc::new(AppState { task_repo });
+    let executor_repo = Arc::new(PostgresExecutorRepository::new(pool.clone()));
+    let state = Arc::new(AppState {
+        task_repo,
+        executor_repo: executor_repo.clone(),
+    });
     let mut app = app_router(state);
 
     let executor = Executor {
         id: Uuid::new_v4(),
         session_id: Uuid::new_v4(),
+        capabilities: vec![runtime_pack.clone()],
     };
     executor_repo.upsert_executor(&executor).await.unwrap();
 
@@ -141,6 +151,27 @@ async fn test_full_api_flow() {
     let lease = body_json.lease.unwrap();
     assert_eq!(lease.executor_id, executor.id);
 
+    let running_req = TaskStatusUpdateRequest {
+        status: "Running".to_string(),
+        lease_id: lease.id,
+        executor_id: executor.id,
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/tasks/{task_id}/status"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&running_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
     let status_req = TaskStatusUpdateRequest {
         status: "Succeeded".to_string(),
         lease_id: lease.id,
@@ -187,7 +218,11 @@ async fn test_reject_mismatched_artifact_runtime() {
     .unwrap();
 
     let task_repo = Arc::new(PostgresTaskRepository::new(pool.clone()));
-    let state = Arc::new(AppState { task_repo });
+    let executor_repo = Arc::new(PostgresExecutorRepository::new(pool.clone()));
+    let state = Arc::new(AppState {
+        task_repo,
+        executor_repo,
+    });
     let app = app_router(state);
 
     let submit_req = TaskSubmitRequest {
@@ -214,4 +249,54 @@ async fn test_reject_mismatched_artifact_runtime() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn test_register_and_heartbeat_endpoints() {
+    let pool = setup_db().await;
+    let task_repo = Arc::new(PostgresTaskRepository::new(pool.clone()));
+    let executor_repo = Arc::new(PostgresExecutorRepository::new(pool.clone()));
+    let state = Arc::new(AppState {
+        task_repo,
+        executor_repo,
+    });
+    let app = app_router(state);
+
+    let executor_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let register_req = RegisterExecutorRequest {
+        executor_id,
+        session_id,
+        capabilities: vec!["python-3.11-v1".to_string()],
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/executors/register")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&register_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let heartbeat_req = HeartbeatRequest { executor_id };
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/executors/heartbeat")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&heartbeat_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }

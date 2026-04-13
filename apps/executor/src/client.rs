@@ -1,5 +1,7 @@
 use domain::{Task, TaskLease};
-use protocol::api::{PollRequest, PollResponse};
+use protocol::api::{
+    HeartbeatRequest, PollRequest, PollResponse, RegisterExecutorRequest, TaskStatusUpdateRequest,
+};
 use reqwest::{Client, Url};
 use uuid::Uuid;
 
@@ -15,15 +17,59 @@ pub struct CplaneClient {
     client: Client,
     base_url: Url,
     executor_id: Uuid,
+    session_id: Uuid,
 }
 
 impl CplaneClient {
-    pub fn new(base_url: &str, executor_id: Uuid) -> Result<Self, ClientError> {
+    pub fn new(base_url: &str, executor_id: Uuid, session_id: Uuid) -> Result<Self, ClientError> {
         Ok(Self {
             client: Client::new(),
             base_url: Url::parse(base_url).map_err(|e| ClientError::Url(e.to_string()))?,
             executor_id,
+            session_id,
         })
+    }
+
+    pub async fn register_executor(&self, capabilities: Vec<String>) -> Result<(), ClientError> {
+        let url = self
+            .base_url
+            .join("/v1/executors/register")
+            .map_err(|e| ClientError::Url(e.to_string()))?;
+
+        let req = RegisterExecutorRequest {
+            executor_id: self.executor_id,
+            session_id: self.session_id,
+            capabilities,
+        };
+
+        self.client
+            .post(url)
+            .json(&req)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        Ok(())
+    }
+
+    pub async fn send_heartbeat(&self) -> Result<(), ClientError> {
+        let url = self
+            .base_url
+            .join("/v1/executors/heartbeat")
+            .map_err(|e| ClientError::Url(e.to_string()))?;
+
+        let req = HeartbeatRequest {
+            executor_id: self.executor_id,
+        };
+
+        self.client
+            .post(url)
+            .json(&req)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        Ok(())
     }
 
     pub async fn poll_task(
@@ -69,8 +115,6 @@ impl CplaneClient {
             .base_url
             .join(&format!("/v1/tasks/{}/status", task_id))
             .map_err(|e| ClientError::Url(e.to_string()))?;
-
-        use protocol::api::TaskStatusUpdateRequest;
 
         let req = TaskStatusUpdateRequest {
             status: status.to_string(),

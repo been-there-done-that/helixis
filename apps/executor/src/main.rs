@@ -5,6 +5,7 @@ mod sandbox;
 use artifact_client::ArtifactDownloader;
 use client::CplaneClient;
 use sandbox::{ProcessSandbox, TaskSandbox};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -15,10 +16,13 @@ async fn main() {
 
     // Use a dynamic secure UUID internally mapped to runtime pack provided via env or fallback
     let executor_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
     tracing::info!("Starting Helixis Executor Agent [{executor_id}]...");
 
-    let client = CplaneClient::new("http://127.0.0.1:3000", executor_id)
-        .expect("Failed to create unified Control Plane internal client");
+    let client = Arc::new(
+        CplaneClient::new("http://127.0.0.1:3000", executor_id, session_id)
+            .expect("Failed to create unified Control Plane internal client"),
+    );
 
     let downloader = ArtifactDownloader::new(
         "http://localhost:9000",
@@ -33,7 +37,22 @@ async fn main() {
     
     let env_pack_id =
         std::env::var("RUNTIME_PACK_ID").unwrap_or_else(|_| "demo-python-pack".to_string());
-    let runtime_pack_id = env_pack_id.as_str();
+    let runtime_pack_id = env_pack_id.clone();
+
+    client
+        .register_executor(vec![runtime_pack_id.clone()])
+        .await
+        .expect("Failed to register executor");
+
+    let heartbeat_client = Arc::clone(&client);
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(15)).await;
+            if let Err(err) = heartbeat_client.send_heartbeat().await {
+                tracing::warn!("Executor heartbeat failed: {}", err);
+            }
+        }
+    });
 
     tracing::info!(
         "Polling for tasks matching runtime_pack: {}",
@@ -45,10 +64,16 @@ async fn main() {
     loop {
         tracing::debug!("Polling queue...");
 
-        match client.poll_task(runtime_pack_id, 120).await {
+        match client.poll_task(&runtime_pack_id, 120).await {
             Ok(Some((task, lease))) => {
                 consecutive_empty_polls = 0;
                 tracing::info!("Acquired task {}! Executing now...", task.id);
+
+                if let Err(err) = client.report_status(task.id, lease.id, "Running").await {
+                    tracing::error!("Failed to mark task {} as running: {}", task.id, err);
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
 
                 // Execute mock task
                 match sandbox.execute(&task).await {
