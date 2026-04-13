@@ -12,35 +12,41 @@ use uuid::Uuid;
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
-    
+
+    // Use a dynamic secure UUID internally mapped to runtime pack provided via env or fallback
     let executor_id = Uuid::new_v4();
     tracing::info!("Starting Helixis Executor Agent [{executor_id}]...");
 
     let client = CplaneClient::new("http://127.0.0.1:3000", executor_id)
-        .expect("Failed to create control plane client");
-        
+        .expect("Failed to create unified Control Plane internal client");
+
     let downloader = ArtifactDownloader::new(
         "http://localhost:9000",
         "minioadmin",
         "minioadmin",
-        "artifacts"
+        "artifacts",
     );
-        
-    let sandbox = ProcessSandbox { downloader };
-    let runtime_pack = "python-3.11-v1"; // The runtime pack this executor can handle
 
-    tracing::info!("Polling for tasks matching runtime_pack: {}", runtime_pack);
+    let sandbox = ProcessSandbox { downloader };
+    let env_pack_id =
+        std::env::var("RUNTIME_PACK_ID").unwrap_or_else(|_| "demo-python-pack".to_string());
+    let runtime_pack_id = env_pack_id.as_str();
+
+    tracing::info!(
+        "Polling for tasks matching runtime_pack: {}",
+        runtime_pack_id
+    );
 
     let mut consecutive_empty_polls = 0;
 
     loop {
         tracing::debug!("Polling queue...");
-        
-        match client.poll_task(runtime_pack, 120).await {
+
+        match client.poll_task(runtime_pack_id, 120).await {
             Ok(Some((task, _lease))) => {
                 consecutive_empty_polls = 0;
                 tracing::info!("Acquired task {}! Executing now...", task.id);
-                
+
                 // Execute mock task
                 match sandbox.execute(&task).await {
                     Ok(_) => {
@@ -67,7 +73,11 @@ async fn main() {
             Err(e) => {
                 consecutive_empty_polls += 1;
                 let delay = std::cmp::min(1 << consecutive_empty_polls, 30);
-                tracing::error!("Failed to poll control plane: {}. Retrying in {} seconds...", e, delay);
+                tracing::error!(
+                    "Failed to poll control plane: {}. Retrying in {} seconds...",
+                    e,
+                    delay
+                );
                 sleep(Duration::from_secs(delay as u64)).await;
             }
         }

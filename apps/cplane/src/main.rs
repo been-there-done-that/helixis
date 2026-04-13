@@ -13,11 +13,11 @@ async fn main() {
 
     let db_url = env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/helixis".into());
-        
+
     let pool = db::create_pool(&db_url)
         .await
         .expect("Failed to create postgres pool");
-        
+
     let task_repo = Arc::new(PostgresTaskRepository::new(pool));
     let state = Arc::new(AppState { task_repo });
     let app = app_router(state);

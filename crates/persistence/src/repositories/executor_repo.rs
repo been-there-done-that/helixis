@@ -33,7 +33,10 @@ impl ExecutorRepository for PostgresExecutorRepository {
         sqlx::query!(
             "UPDATE executors SET last_heartbeat_at = NOW() WHERE id = $1",
             id
-        ).execute(&self.pool).await.map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
         Ok(())
     }
 }

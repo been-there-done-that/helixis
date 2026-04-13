@@ -1,4 +1,4 @@
-use application::ports::repositories::{ExecutorRepository, TaskRepository, RepositoryError};
+use application::ports::repositories::{ExecutorRepository, RepositoryError, TaskRepository};
 use domain::{Artifact, Executor, RuntimePack, Task, TaskStatus};
 use persistence::{
     db,
@@ -10,8 +10,11 @@ use uuid::Uuid;
 
 async fn setup_db() -> PgPool {
     let _ = dotenvy::dotenv();
-    let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/helixis".into());
-    db::create_pool(&db_url).await.expect("Failed to connect to pool")
+    let db_url = env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/helixis".into());
+    db::create_pool(&db_url)
+        .await
+        .expect("Failed to connect to pool")
 }
 
 async fn insert_prereqs(pool: &PgPool) -> (Uuid, Uuid, String) {
@@ -111,8 +114,12 @@ async fn test_executor_heartbeat() {
         session_id: Uuid::new_v4(),
     };
 
-    repo.upsert_executor(&executor).await.expect("Failed to upsert executor");
-    repo.record_heartbeat(executor.id).await.expect("Failed to record heartbeat");
+    repo.upsert_executor(&executor)
+        .await
+        .expect("Failed to upsert executor");
+    repo.record_heartbeat(executor.id)
+        .await
+        .expect("Failed to record heartbeat");
 }
 
 #[tokio::test]

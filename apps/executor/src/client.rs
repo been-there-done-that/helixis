@@ -26,22 +26,26 @@ impl CplaneClient {
         })
     }
 
-    pub async fn poll_task(&self, runtime_pack_id: &str, lease_duration_sec: i32) -> Result<Option<(Task, TaskLease)>, ClientError> {
-        let url = self.base_url.join("/v1/executors/poll").map_err(|e| ClientError::Url(e.to_string()))?;
-        
+    pub async fn poll_task(
+        &self,
+        runtime_pack_id: &str,
+        lease_duration_sec: i32,
+    ) -> Result<Option<(Task, TaskLease)>, ClientError> {
+        let url = self
+            .base_url
+            .join("/v1/executors/poll")
+            .map_err(|e| ClientError::Url(e.to_string()))?;
+
         let req = PollRequest {
             runtime_pack_id: runtime_pack_id.to_string(),
             executor_id: self.executor_id,
             lease_duration_sec,
         };
 
-        let response = self.client.post(url)
-            .json(&req)
-            .send()
-            .await?;
-            
+        let response = self.client.post(url).json(&req).send().await?;
+
         let poll_response: PollResponse = response.json().await?;
-        
+
         if let (Some(task), Some(lease)) = (poll_response.task, poll_response.lease) {
             Ok(Some((task, lease)))
         } else {
@@ -50,20 +54,19 @@ impl CplaneClient {
     }
 
     pub async fn report_status(&self, task_id: Uuid, status: &str) -> Result<(), ClientError> {
-        let url = self.base_url.join(&format!("/v1/tasks/{}/status", task_id))
+        let url = self
+            .base_url
+            .join(&format!("/v1/tasks/{}/status", task_id))
             .map_err(|e| ClientError::Url(e.to_string()))?;
-        
+
         use protocol::api::TaskStatusUpdateRequest;
-        
+
         let req = TaskStatusUpdateRequest {
             status: status.to_string(),
         };
 
-        self.client.post(url)
-            .json(&req)
-            .send()
-            .await?;
-            
+        self.client.post(url).json(&req).send().await?;
+
         Ok(())
     }
 }

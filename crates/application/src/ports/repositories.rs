@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use domain::{Task, TaskLease, Executor, TaskStatus};
+use domain::{Executor, Task, TaskLease, TaskStatus};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -13,17 +13,18 @@ pub enum RepositoryError {
 #[async_trait]
 pub trait TaskRepository: Send + Sync {
     async fn get_task(&self, id: Uuid) -> Result<Option<Task>, RepositoryError>;
-    
+
     // Updates the status of an existing task
-    async fn update_task_status(&self, id: Uuid, status: TaskStatus) -> Result<(), RepositoryError>;
+    async fn update_task_status(&self, id: Uuid, status: TaskStatus)
+    -> Result<(), RepositoryError>;
     async fn insert_task(&self, task: &Task) -> Result<(), RepositoryError>;
-    
+
     /// Polling queue items natively
     async fn poll_and_lease(
-        &self, 
-        runtime_pack_id: &str, 
-        executor_id: Uuid, 
-        lease_duration_sec: i32
+        &self,
+        runtime_pack_id: &str,
+        executor_id: Uuid,
+        lease_duration_sec: i32,
     ) -> Result<Option<(Task, TaskLease)>, RepositoryError>;
 }
 

@@ -1,7 +1,10 @@
 pub mod handlers;
 
-use axum::{routing::{get, post}, Router};
-use handlers::{submit_task, AppState};
+use axum::{
+    Router,
+    routing::{get, post},
+};
+use handlers::{AppState, submit_task};
 use std::sync::Arc;
 
 pub fn app_router(state: Arc<AppState>) -> Router {

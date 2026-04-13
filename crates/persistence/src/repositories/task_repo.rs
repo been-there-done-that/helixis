@@ -21,12 +21,12 @@ impl TaskRepository for PostgresTaskRepository {
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
-            
+
         let row = match row {
             Some(r) => r,
             None => return Ok(None),
         };
-        
+
         let status_str: String = row.status;
         let status = match status_str.as_str() {
             "Queued" => TaskStatus::Queued,
@@ -39,7 +39,7 @@ impl TaskRepository for PostgresTaskRepository {
             "DeadLetter" => TaskStatus::DeadLetter,
             _ => TaskStatus::Failed,
         };
-        
+
         Ok(Some(Task {
             id: row.id,
             tenant_id: row.tenant_id,
@@ -66,7 +66,7 @@ impl TaskRepository for PostgresTaskRepository {
             TaskStatus::TimedOut => "TimedOut",
             TaskStatus::DeadLetter => "DeadLetter",
         };
-        
+
         sqlx::query!(
             "INSERT INTO tasks (id, tenant_id, artifact_id, runtime_pack_id, status, priority, rate_limit_key, timeout_seconds, max_attempts, current_attempt, idempotency_key)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
@@ -74,15 +74,19 @@ impl TaskRepository for PostgresTaskRepository {
         ).execute(&self.pool).await.map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
         Ok(())
     }
-    
+
     async fn poll_and_lease(
-        &self, 
-        runtime_pack_id: &str, 
-        executor_id: Uuid, 
-        lease_duration_sec: i32
+        &self,
+        runtime_pack_id: &str,
+        executor_id: Uuid,
+        lease_duration_sec: i32,
     ) -> Result<Option<(Task, TaskLease)>, RepositoryError> {
-        let mut tx = self.pool.begin().await.map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
-        
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
         let row = sqlx::query!(
             r#"
             UPDATE tasks
@@ -97,28 +101,44 @@ impl TaskRepository for PostgresTaskRepository {
             RETURNING *
             "#,
             runtime_pack_id
-        ).fetch_optional(&mut *tx).await.map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
-        
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
         let row = match row {
             Some(r) => r,
             None => return Ok(None),
         };
-        
+
         let task_id = row.id;
         let lease_id = Uuid::new_v4();
-        
+
+        // Auto-stub the executor session to prevent foreign-key failures in absence of proper heartbeat phase
+        sqlx::query!(
+            "INSERT INTO executors (id, session_id, capabilities_json) VALUES ($1, gen_random_uuid(), '[]'::jsonb) ON CONFLICT (id) DO NOTHING",
+            executor_id
+        ).execute(&mut *tx).await.map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
         // Use a simple string building approach for the interval
-        let query_str = format!("INSERT INTO task_leases (id, task_id, executor_id, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '{} seconds')", lease_duration_sec);
+        let query_str = format!(
+            "INSERT INTO task_leases (id, task_id, executor_id, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '{} seconds')",
+            lease_duration_sec
+        );
         sqlx::query(&query_str)
             .bind(lease_id)
             .bind(task_id)
             .bind(executor_id)
-            .execute(&mut *tx).await.map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
-        
-        tx.commit().await.map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
-        
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
         let status = TaskStatus::Scheduled;
-        
+
         let task = Task {
             id: row.id,
             tenant_id: row.tenant_id,
@@ -132,17 +152,21 @@ impl TaskRepository for PostgresTaskRepository {
             current_attempt: row.current_attempt,
             idempotency_key: row.idempotency_key,
         };
-        
+
         let lease = TaskLease {
             id: lease_id,
             task_id,
             executor_id,
         };
-        
+
         Ok(Some((task, lease)))
     }
 
-    async fn update_task_status(&self, id: Uuid, status: TaskStatus) -> Result<(), RepositoryError> {
+    async fn update_task_status(
+        &self,
+        id: Uuid,
+        status: TaskStatus,
+    ) -> Result<(), RepositoryError> {
         let status_str = match status {
             TaskStatus::Queued => "Queued",
             TaskStatus::Scheduled => "Scheduled",

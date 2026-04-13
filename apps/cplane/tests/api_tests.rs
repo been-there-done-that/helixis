@@ -1,26 +1,28 @@
+use application::ports::repositories::ExecutorRepository;
 use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
 use cplane::{app_router, handlers::AppState};
 use domain::{Executor, TaskStatus};
+use http_body_util::BodyExt;
 use persistence::{
     db,
     repositories::{executor_repo::PostgresExecutorRepository, task_repo::PostgresTaskRepository},
 };
-use protocol::api::{TaskResponse, TaskSubmitRequest, PollRequest, PollResponse};
+use protocol::api::{PollRequest, PollResponse, TaskResponse, TaskSubmitRequest};
 use std::env;
 use std::sync::Arc;
 use tower::{Service, ServiceExt};
 use uuid::Uuid;
-use http_body_util::BodyExt;
-use application::ports::repositories::ExecutorRepository;
 
 async fn setup_db() -> sqlx::PgPool {
     let _ = dotenvy::dotenv();
     let db_url = env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/helixis".into());
-    db::create_pool(&db_url).await.expect("Failed to connect to pool")
+    db::create_pool(&db_url)
+        .await
+        .expect("Failed to connect to pool")
 }
 
 async fn insert_prereqs(pool: &sqlx::PgPool) -> (Uuid, String) {
@@ -84,7 +86,8 @@ async fn test_full_api_flow() {
         idempotency_key: None,
     };
 
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -110,7 +113,8 @@ async fn test_full_api_flow() {
         lease_duration_sec: 120,
     };
 
-    let response = app.clone()
+    let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -125,12 +129,12 @@ async fn test_full_api_flow() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body_json: PollResponse = serde_json::from_slice(&body).unwrap();
-    
+
     assert!(body_json.task.is_some());
     let polled_task = body_json.task.unwrap();
     assert_eq!(polled_task.id, task_id);
     assert_eq!(polled_task.status, TaskStatus::Scheduled);
-    
+
     assert!(body_json.lease.is_some());
     let lease = body_json.lease.unwrap();
     assert_eq!(lease.executor_id, executor.id);

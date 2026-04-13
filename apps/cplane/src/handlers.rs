@@ -1,14 +1,16 @@
 use application::ports::repositories::{RepositoryError, TaskRepository};
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
-use protocol::api::{PollRequest, PollResponse, TaskResponse, TaskSubmitRequest, TaskStatusUpdateRequest};
+use protocol::api::{
+    PollRequest, PollResponse, TaskResponse, TaskStatusUpdateRequest, TaskSubmitRequest,
+};
+use serde_json::json;
 use std::sync::Arc;
 use uuid::Uuid;
-use serde_json::json;
 
 pub struct AppState {
     pub task_repo: Arc<dyn TaskRepository>,
@@ -101,7 +103,15 @@ pub async fn poll_tasks(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<PollRequest>,
 ) -> impl IntoResponse {
-    match state.task_repo.poll_and_lease(&payload.runtime_pack_id, payload.executor_id, payload.lease_duration_sec).await {
+    match state
+        .task_repo
+        .poll_and_lease(
+            &payload.runtime_pack_id,
+            payload.executor_id,
+            payload.lease_duration_sec,
+        )
+        .await
+    {
         Ok(Some((task, lease))) => {
             let response = PollResponse {
                 task: Some(task),

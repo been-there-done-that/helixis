@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use object_store::aws::AmazonS3Builder;
-use object_store::{path::Path as StorePath, ObjectStore};
+use object_store::{ObjectStore, path::Path as StorePath};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
@@ -22,55 +22,70 @@ pub struct ArtifactDownloader {
 impl ArtifactDownloader {
     pub fn new(endpoint: &str, access_key: &str, secret_key: &str, bucket: &str) -> Self {
         tracing::info!("Initializing S3 client connected to {}", endpoint);
-        
+
         let store = AmazonS3Builder::new()
             .with_endpoint(endpoint)
             .with_access_key_id(access_key)
             .with_secret_access_key(secret_key)
             .with_region("us-east-1") // MinIO standard default
             .with_bucket_name(bucket)
-            .with_allow_http(true)    // Required for raw minio
+            .with_allow_http(true) // Required for raw minio
+            .with_virtual_hosted_style_request(false) // Required for local minio IPs
             .build()
             .expect("Failed to initialize AmazonS3 client");
-            
+
         Self {
             store: Arc::new(store),
             bucket: bucket.to_string(),
         }
     }
 
-    pub async fn ensure_artifact_cached(&self, artifact_id: Uuid) -> Result<PathBuf, ArtifactError> {
+    pub async fn ensure_artifact_cached(
+        &self,
+        artifact_id: Uuid,
+    ) -> Result<PathBuf, ArtifactError> {
         let object_key = format!("{}", artifact_id);
         let cache_dir = Path::new("/tmp/helixis/cache/artifacts").join(&object_key);
-        
+
         if cache_dir.exists() {
             tracing::debug!("Artifact {} found in cache. Warm start!", artifact_id);
             return Ok(cache_dir);
         }
 
-        tracing::info!("Cache miss for {}. Fetching object: s3://{}/{}", artifact_id, self.bucket, object_key);
-        
+        tracing::info!(
+            "Cache miss for {}. Fetching object: s3://{}/{}",
+            artifact_id,
+            self.bucket,
+            object_key
+        );
+
         let path = StorePath::from(object_key.as_str());
         let body = self.store.get(&path).await?;
         let bytes: Bytes = body.bytes().await?;
-        
+
         // Ensure cache directory exists
         fs::create_dir_all(&cache_dir).await?;
-        
+
         // Decompress logic inside thread blocking since tar unpacking is CPU bound
         let dir_clone = cache_dir.clone();
         tokio::task::spawn_blocking(move || {
             use flate2::read::GzDecoder;
-            use tar::Archive;
             use std::io::Cursor;
+            use tar::Archive;
 
             let tar = GzDecoder::new(Cursor::new(bytes.to_vec()));
             let mut archive = Archive::new(tar);
             archive.unpack(&dir_clone)
-        }).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))??;
-        
-        tracing::info!("Successfully unpacked artifact {} to {:?}", artifact_id, cache_dir);
-        
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))??;
+
+        tracing::info!(
+            "Successfully unpacked artifact {} to {:?}",
+            artifact_id,
+            cache_dir
+        );
+
         Ok(cache_dir)
     }
 }
