@@ -1,6 +1,16 @@
-[package]
-name = "helixis"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = [
+    "apps/*",
+    "crates/*",
+    "xtask"
+]
 
-[dependencies]
+[workspace.dependencies]
+tokio = { version = "1.40", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "uuid", "time"] }
+tracing = "0.1"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+thiserror = "2.0"
+axum = "0.7"
