@@ -16,7 +16,8 @@ pub struct TaskSubmitRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TaskResponse {
-    pub task: Task,
+    pub id: Uuid,
+    pub status: domain::TaskStatus,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -30,4 +31,9 @@ pub struct PollRequest {
 pub struct PollResponse {
     pub task: Option<Task>,
     pub lease: Option<TaskLease>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TaskStatusUpdateRequest {
+    pub status: String,
 }

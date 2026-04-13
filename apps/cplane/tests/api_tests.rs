@@ -97,11 +97,11 @@ async fn test_full_api_flow() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::CREATED);
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let body_json: TaskResponse = serde_json::from_slice(&body).unwrap();
-    let task_id = body_json.task.id;
+    let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body_json: TaskResponse = serde_json::from_slice(&body_bytes).unwrap();
+    let task_id = body_json.id;
 
-    assert_eq!(body_json.task.status, TaskStatus::Queued);
+    assert_eq!(body_json.status, TaskStatus::Queued);
 
     // 2. Poll POST
     let poll_req = PollRequest {

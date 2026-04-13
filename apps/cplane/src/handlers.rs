@@ -5,11 +5,10 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use domain::{Task, TaskStatus};
-use protocol::api::{PollRequest, PollResponse, TaskResponse, TaskSubmitRequest};
-use serde_json::json;
+use protocol::api::{PollRequest, PollResponse, TaskResponse, TaskSubmitRequest, TaskStatusUpdateRequest};
 use std::sync::Arc;
 use uuid::Uuid;
+use serde_json::json;
 
 pub struct AppState {
     pub task_repo: Arc<dyn TaskRepository>,
@@ -47,14 +46,14 @@ impl From<RepositoryError> for ApiError {
 pub async fn submit_task(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<TaskSubmitRequest>,
-) -> Result<(StatusCode, Json<TaskResponse>), ApiError> {
+) -> impl IntoResponse {
     let task_id = Uuid::new_v4();
-    let task = Task {
+    let task = domain::Task {
         id: task_id,
         tenant_id: payload.tenant_id,
         artifact_id: payload.artifact_id,
         runtime_pack_id: payload.runtime_pack_id,
-        status: TaskStatus::Queued,
+        status: domain::TaskStatus::Queued,
         priority: payload.priority.unwrap_or(0),
         rate_limit_key: payload.rate_limit_key,
         timeout_seconds: payload.timeout_seconds.unwrap_or(300),
@@ -63,40 +62,83 @@ pub async fn submit_task(
         idempotency_key: payload.idempotency_key,
     };
 
-    state.task_repo.insert_task(&task).await?;
-
-    Ok((StatusCode::CREATED, Json(TaskResponse { task })))
+    match state.task_repo.insert_task(&task).await {
+        Ok(_) => {
+            let response = TaskResponse {
+                id: task.id,
+                status: task.status,
+            };
+            (StatusCode::CREATED, Json(response)).into_response()
+        }
+        Err(e) => {
+            tracing::error!("Database error: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 pub async fn get_task(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-) -> Result<Json<TaskResponse>, ApiError> {
-    let task = state.task_repo.get_task(id).await?;
-    Ok(Json(TaskResponse { task }))
+) -> impl IntoResponse {
+    match state.task_repo.get_task(id).await {
+        Ok(Some(task)) => {
+            let response = TaskResponse {
+                id: task.id,
+                status: task.status,
+            };
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!("Database error: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 pub async fn poll_tasks(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<PollRequest>,
-) -> Result<Json<PollResponse>, ApiError> {
-    let result = state
-        .task_repo
-        .poll_and_lease(
-            &payload.runtime_pack_id,
-            payload.executor_id,
-            payload.lease_duration_sec,
-        )
-        .await?;
+) -> impl IntoResponse {
+    match state.task_repo.poll_and_lease(&payload.runtime_pack_id, payload.executor_id, payload.lease_duration_sec).await {
+        Ok(Some((task, lease))) => {
+            let response = PollResponse {
+                task: Some(task),
+                lease: Some(lease),
+            };
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Ok(None) => {
+            let response = PollResponse {
+                task: None,
+                lease: None,
+            };
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(e) => {
+            tracing::error!("Database error during poll: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
 
-    match result {
-        Some((task, lease)) => Ok(Json(PollResponse {
-            task: Some(task),
-            lease: Some(lease),
-        })),
-        None => Ok(Json(PollResponse {
-            task: None,
-            lease: None,
-        })),
+pub async fn update_task_status(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<TaskStatusUpdateRequest>,
+) -> impl IntoResponse {
+    let status = match payload.status.as_str() {
+        "Succeeded" => domain::TaskStatus::Succeeded,
+        "Failed" => domain::TaskStatus::Failed,
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    match state.task_repo.update_task_status(id, status).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!("Database error during status update: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }

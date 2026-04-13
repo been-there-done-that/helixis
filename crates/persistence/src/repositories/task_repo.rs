@@ -16,13 +16,16 @@ impl PostgresTaskRepository {
 
 #[async_trait]
 impl TaskRepository for PostgresTaskRepository {
-    async fn get_task(&self, id: Uuid) -> Result<Task, RepositoryError> {
+    async fn get_task(&self, id: Uuid) -> Result<Option<Task>, RepositoryError> {
         let row = sqlx::query!("SELECT * FROM tasks WHERE id = $1", id)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
             
-        let row = row.ok_or(RepositoryError::NotFound)?;
+        let row = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
         
         let status_str: String = row.status;
         let status = match status_str.as_str() {
@@ -37,7 +40,7 @@ impl TaskRepository for PostgresTaskRepository {
             _ => TaskStatus::Failed,
         };
         
-        Ok(Task {
+        Ok(Some(Task {
             id: row.id,
             tenant_id: row.tenant_id,
             artifact_id: row.artifact_id,
@@ -49,7 +52,7 @@ impl TaskRepository for PostgresTaskRepository {
             max_attempts: row.max_attempts,
             current_attempt: row.current_attempt,
             idempotency_key: row.idempotency_key,
-        })
+        }))
     }
 
     async fn insert_task(&self, task: &Task) -> Result<(), RepositoryError> {
@@ -137,5 +140,33 @@ impl TaskRepository for PostgresTaskRepository {
         };
         
         Ok(Some((task, lease)))
+    }
+
+    async fn update_task_status(&self, id: Uuid, status: TaskStatus) -> Result<(), RepositoryError> {
+        let status_str = match status {
+            TaskStatus::Queued => "Queued",
+            TaskStatus::Scheduled => "Scheduled",
+            TaskStatus::Running => "Running",
+            TaskStatus::Succeeded => "Succeeded",
+            TaskStatus::Failed => "Failed",
+            TaskStatus::Cancelled => "Cancelled",
+            TaskStatus::TimedOut => "TimedOut",
+            TaskStatus::DeadLetter => "DeadLetter",
+        };
+
+        sqlx::query!(
+            r#"
+            UPDATE tasks
+            SET status = $1, updated_at = NOW()
+            WHERE id = $2
+            "#,
+            status_str,
+            id
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+        Ok(())
     }
 }

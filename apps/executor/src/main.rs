@@ -43,8 +43,18 @@ async fn main() {
                 
                 // Execute mock task
                 match sandbox.execute(&task).await {
-                    Ok(_) => tracing::info!("Execution Succeeded. (TODO: Report status to cplane)"),
-                    Err(e) => tracing::error!("Execution Failed: {}", e),
+                    Ok(_) => {
+                        tracing::info!("Execution Succeeded. Reporting status to cplane...");
+                        if let Err(e) = client.report_status(task.id, "Succeeded").await {
+                            tracing::error!("Failed to report Succeeded status: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Execution Failed: {}. Reporting status to cplane...", e);
+                        if let Err(err) = client.report_status(task.id, "Failed").await {
+                            tracing::error!("Failed to report Failed status: {}", err);
+                        }
+                    }
                 }
             }
             Ok(None) => {

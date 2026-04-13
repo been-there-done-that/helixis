@@ -48,4 +48,22 @@ impl CplaneClient {
             Ok(None)
         }
     }
+
+    pub async fn report_status(&self, task_id: Uuid, status: &str) -> Result<(), ClientError> {
+        let url = self.base_url.join(&format!("/v1/tasks/{}/status", task_id))
+            .map_err(|e| ClientError::Url(e.to_string()))?;
+        
+        use protocol::api::TaskStatusUpdateRequest;
+        
+        let req = TaskStatusUpdateRequest {
+            status: status.to_string(),
+        };
+
+        self.client.post(url)
+            .json(&req)
+            .send()
+            .await?;
+            
+        Ok(())
+    }
 }

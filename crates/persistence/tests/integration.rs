@@ -78,7 +78,7 @@ async fn test_insert_and_poll() {
     task_repo.insert_task(&task).await.unwrap();
 
     // Verify task fetch
-    let fetched = task_repo.get_task(task_id).await.unwrap();
+    let fetched = task_repo.get_task(task_id).await.unwrap().unwrap();
     assert_eq!(fetched.id, task_id);
 
     // Poll the task
@@ -120,6 +120,6 @@ async fn test_get_not_found() {
     let pool = setup_db().await;
     let repo = PostgresTaskRepository::new(pool.clone());
 
-    let res = repo.get_task(Uuid::new_v4()).await;
-    assert!(matches!(res, Err(RepositoryError::NotFound)));
+    let res = repo.get_task(Uuid::new_v4()).await.unwrap();
+    assert!(res.is_none());
 }
