@@ -17,3 +17,5 @@ thiserror = { workspace = true }
 async-trait = "0.1"
 object_store = { workspace = true }
 bytes = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }

@@ -39,24 +39,38 @@ impl ArtifactDownloader {
         }
     }
 
-    pub async fn download_artifact(&self, artifact_id: Uuid) -> Result<PathBuf, ArtifactError> {
-        // We assume object key is the UUID of the artifact
+    pub async fn ensure_artifact_cached(&self, artifact_id: Uuid) -> Result<PathBuf, ArtifactError> {
         let object_key = format!("{}", artifact_id);
-        let path = StorePath::from(object_key.as_str());
+        let cache_dir = Path::new("/tmp/helixis/cache/artifacts").join(&object_key);
         
-        tracing::debug!("Fetching object: s3://{}/{}", self.bucket, object_key);
+        if cache_dir.exists() {
+            tracing::debug!("Artifact {} found in cache. Warm start!", artifact_id);
+            return Ok(cache_dir);
+        }
+
+        tracing::info!("Cache miss for {}. Fetching object: s3://{}/{}", artifact_id, self.bucket, object_key);
+        
+        let path = StorePath::from(object_key.as_str());
         let body = self.store.get(&path).await?;
         let bytes: Bytes = body.bytes().await?;
         
-        // Write the raw file locally to /tmp/helixis-sandbox/...
-        let sandbox_dir = Path::new("/tmp/helixis-sandbox").join(object_key.as_str());
-        fs::create_dir_all(&sandbox_dir).await?;
+        // Ensure cache directory exists
+        fs::create_dir_all(&cache_dir).await?;
         
-        let artifact_path = sandbox_dir.join("payload.tar.gz"); // using .tar.gz based on context
-        fs::write(&artifact_path, &bytes).await?;
+        // Decompress logic inside thread blocking since tar unpacking is CPU bound
+        let dir_clone = cache_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            use flate2::read::GzDecoder;
+            use tar::Archive;
+            use std::io::Cursor;
+
+            let tar = GzDecoder::new(Cursor::new(bytes.to_vec()));
+            let mut archive = Archive::new(tar);
+            archive.unpack(&dir_clone)
+        }).await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))??;
         
-        tracing::info!("Successfully dumped artifact to {:?}", artifact_path);
+        tracing::info!("Successfully unpacked artifact {} to {:?}", artifact_id, cache_dir);
         
-        Ok(artifact_path)
+        Ok(cache_dir)
     }
 }
