@@ -4,7 +4,7 @@ use application::ports::repositories::{
 };
 use axum::{
     Json,
-    body::Body,
+    body::{Body, Bytes, to_bytes},
     extract::{Path, State},
     http::StatusCode,
     http::header::{CONTENT_TYPE, HeaderValue},
@@ -51,6 +51,7 @@ pub struct AppState {
     pub rate_limit_repo: Arc<dyn RateLimitRepository>,
     pub secret_repo: Arc<dyn SecretRepository>,
     pub output_store: Arc<dyn ObjectStore>,
+    pub artifact_store: Arc<dyn ObjectStore>,
     pub log_hub: Arc<LiveLogHub>,
 }
 
@@ -173,13 +174,19 @@ pub async fn stream_task_logs(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let historical = state
+        .task_repo
+        .list_task_log_chunks(id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|chunk| Ok(Event::default().data(chunk)));
     let receiver = state.log_hub.subscribe(id).await;
-    let stream = BroadcastStream::new(receiver).filter_map(|message| {
-        match message {
-            Ok(chunk) => Some(Ok(Event::default().data(chunk))),
-            Err(_) => None,
-        }
+    let live = BroadcastStream::new(receiver).filter_map(|message| match message {
+        Ok(chunk) => Some(Ok(Event::default().data(chunk))),
+        Err(_) => None,
     });
+    let stream = tokio_stream::iter(historical).chain(live);
 
     Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(5)))
 }
@@ -189,10 +196,28 @@ pub async fn append_task_log(
     Path(id): Path<Uuid>,
     Json(payload): Json<LiveLogChunkRequest>,
 ) -> impl IntoResponse {
-    let chunk = format!("[{}] {}", payload.stream, payload.chunk);
-    state.log_hub.publish(id, chunk).await;
-    let _ = (payload.lease_id, payload.executor_id);
-    StatusCode::NO_CONTENT
+    match state
+        .task_repo
+        .append_task_log_chunk(
+            id,
+            payload.lease_id,
+            payload.executor_id,
+            &payload.stream,
+            &payload.chunk,
+        )
+        .await
+    {
+        Ok(()) => {
+            let chunk = format!("[{}] {}", payload.stream, payload.chunk);
+            state.log_hub.publish(id, chunk).await;
+            StatusCode::NO_CONTENT
+        }
+        Err(RepositoryError::Conflict(_)) => StatusCode::CONFLICT,
+        Err(err) => {
+            tracing::error!("Failed to append task log chunk: {:?}", err);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
 
 pub async fn get_task_result(
@@ -216,6 +241,21 @@ pub async fn poll_tasks(
         .await
     {
         Ok(Some((task, lease))) => {
+            let artifact = match state.artifact_repo.get_artifact(task.artifact_id).await {
+                Ok(Some(artifact)) => artifact,
+                Ok(None) => {
+                    tracing::error!(
+                        "Task {} references missing artifact {}",
+                        task.id,
+                        task.artifact_id
+                    );
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+                Err(err) => {
+                    tracing::error!("Failed to load artifact during poll: {:?}", err);
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
             let payload =
                 match load_task_payload(&state.output_store, task.payload_ref.as_deref()).await {
                     Ok(payload) => payload,
@@ -234,6 +274,7 @@ pub async fn poll_tasks(
             let response = PollResponse {
                 task: Some(task),
                 lease: Some(lease),
+                artifact: Some(artifact),
                 environment,
                 payload,
             };
@@ -243,6 +284,7 @@ pub async fn poll_tasks(
             let response = PollResponse {
                 task: None,
                 lease: None,
+                artifact: None,
                 environment: BTreeMap::new(),
                 payload: None,
             };
@@ -312,6 +354,42 @@ pub async fn get_artifact(
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(err) => {
             tracing::error!("Database error during artifact lookup: {:?}", err);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn upload_artifact_content(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    body: Body,
+) -> impl IntoResponse {
+    let artifact = match state.artifact_repo.get_artifact(id).await {
+        Ok(Some(artifact)) => artifact,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!("Database error during artifact upload lookup: {:?}", err);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let bytes: Bytes = match to_bytes(body, artifact.size_bytes.max(0) as usize + 1).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!("Artifact upload body rejected: {}", err);
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+
+    if bytes.len() as i64 != artifact.size_bytes {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let key = artifact.id.to_string();
+    match storage::put_bytes(&state.artifact_store, &key, bytes.to_vec()).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => {
+            tracing::error!("Failed to upload artifact content: {}", err);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -439,9 +517,28 @@ async fn fetch_task_blob(state: Arc<AppState>, id: Uuid, kind: BlobKind) -> Resp
     };
 
     let object_key = match kind {
-        BlobKind::Logs => outputs.logs_ref,
+        BlobKind::Logs => outputs.logs_ref.clone(),
         BlobKind::Result => outputs.result_ref,
     };
+
+    if matches!(kind, BlobKind::Logs) && object_key.is_none() {
+        match state.task_repo.list_task_log_chunks(id).await {
+            Ok(chunks) if !chunks.is_empty() => {
+                let mut response = Response::new(Body::from(chunks.join("")));
+                *response.status_mut() = StatusCode::OK;
+                response.headers_mut().insert(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("text/plain; charset=utf-8"),
+                );
+                return response;
+            }
+            Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+            Err(err) => {
+                tracing::error!("Failed to load persisted log chunks: {:?}", err);
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
 
     let object_key = match object_key {
         Some(key) => key,

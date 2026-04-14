@@ -74,6 +74,7 @@ fn build_state(pool: &sqlx::PgPool) -> Arc<AppState> {
             "test-secret-key",
         )),
         output_store: Arc::new(InMemory::new()),
+        artifact_store: Arc::new(InMemory::new()),
         log_hub: Arc::new(LiveLogHub::new()),
     })
 }
@@ -671,6 +672,77 @@ async fn test_register_and_get_artifact() {
 }
 
 #[tokio::test]
+async fn test_upload_artifact_content_stores_blob() {
+    let pool = setup_db().await;
+    let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
+    let artifact_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = Arc::new(AppState {
+        task_repo: Arc::new(PostgresTaskRepository::new(pool.clone())),
+        artifact_repo: Arc::new(PostgresArtifactRepository::new(pool.clone())),
+        executor_repo: Arc::new(PostgresExecutorRepository::new(pool.clone())),
+        rate_limit_repo: Arc::new(PostgresRateLimitRepository::new(pool.clone())),
+        secret_repo: Arc::new(PostgresSecretRepository::new(
+            pool.clone(),
+            "test-secret-key",
+        )),
+        output_store: Arc::new(InMemory::new()),
+        artifact_store: Arc::clone(&artifact_store),
+        log_hub: Arc::new(LiveLogHub::new()),
+    });
+    let app = app_router(state);
+
+    let register = ArtifactRegisterRequest {
+        tenant_id,
+        digest: format!("sha256:{}", Uuid::new_v4()),
+        runtime_pack_id: runtime_pack,
+        entrypoint: "main.py".to_string(),
+        size_bytes: 4,
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/artifacts")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&register).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let artifact_response: ArtifactResponse = serde_json::from_slice(&body).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/artifacts/{}/content",
+                    artifact_response.artifact.id
+                ))
+                .body(Body::from("test"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let bytes = artifact_store
+        .get(&object_store::path::Path::from(
+            artifact_response.artifact.id.to_string(),
+        ))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"test");
+}
+
+#[tokio::test]
 async fn test_task_output_retrieval_endpoints() {
     let pool = setup_db().await;
     let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
@@ -685,6 +757,7 @@ async fn test_task_output_retrieval_endpoints() {
             "test-secret-key",
         )),
         output_store: output_store.clone(),
+        artifact_store: Arc::new(InMemory::new()),
         log_hub: Arc::new(LiveLogHub::new()),
     });
     let app = app_router(state);
@@ -870,13 +943,57 @@ async fn test_poll_includes_offloaded_payload() {
 #[tokio::test]
 async fn test_append_live_log_publishes_to_hub() {
     let pool = setup_db().await;
+    let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
+    let artifact_id = Uuid::new_v4();
+    let task_id = Uuid::new_v4();
+    sqlx::query!(
+        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
+        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
     let state = build_state(&pool);
-    let mut receiver = state.log_hub.subscribe(Uuid::nil()).await;
+    let mut receiver = state.log_hub.subscribe(task_id).await;
     let app = app_router(Arc::clone(&state));
+    let executor_repo = PostgresExecutorRepository::new(pool.clone());
+    let executor = Executor {
+        id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+        capabilities: vec!["python-3.11".to_string()],
+    };
+    executor_repo.upsert_executor(&executor).await.unwrap();
+
+    sqlx::query!(
+        r#"
+        INSERT INTO tasks (
+            id, tenant_id, artifact_id, runtime_pack_id, status, timeout_seconds, max_attempts, current_attempt
+        ) VALUES ($1, $2, $3, $4, 'Running', 30, 1, 1)
+        "#,
+        task_id,
+        tenant_id,
+        artifact_id,
+        runtime_pack
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let lease_id = Uuid::new_v4();
+    sqlx::query!(
+        "INSERT INTO task_leases (id, task_id, executor_id, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '1 minute')",
+        lease_id,
+        task_id,
+        executor.id
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let request = LiveLogChunkRequest {
-        lease_id: Uuid::new_v4(),
-        executor_id: Uuid::new_v4(),
+        lease_id,
+        executor_id: executor.id,
         stream: "stdout".to_string(),
         chunk: "stream line".to_string(),
     };
@@ -885,7 +1002,7 @@ async fn test_append_live_log_publishes_to_hub() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/v1/tasks/{}/logs/append", Uuid::nil()))
+                .uri(format!("/v1/tasks/{}/logs/append", task_id))
                 .header("Content-Type", "application/json")
                 .body(Body::from(serde_json::to_string(&request).unwrap()))
                 .unwrap(),
@@ -896,4 +1013,91 @@ async fn test_append_live_log_publishes_to_hub() {
 
     let received = receiver.recv().await.unwrap();
     assert_eq!(received, "[stdout] stream line");
+}
+
+#[tokio::test]
+async fn test_get_logs_replays_persisted_chunks() {
+    let pool = setup_db().await;
+    let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
+    let artifact_id = Uuid::new_v4();
+    sqlx::query!(
+        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
+        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = build_state(&pool);
+    let app = app_router(Arc::clone(&state));
+
+    let executor = Executor {
+        id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+        capabilities: vec![runtime_pack.clone()],
+    };
+    let executor_repo = PostgresExecutorRepository::new(pool.clone());
+    executor_repo.upsert_executor(&executor).await.unwrap();
+
+    let task_id = Uuid::new_v4();
+    sqlx::query!(
+        r#"
+        INSERT INTO tasks (
+            id, tenant_id, artifact_id, runtime_pack_id, status, timeout_seconds, max_attempts, current_attempt
+        ) VALUES ($1, $2, $3, $4, 'Running', 30, 1, 1)
+        "#,
+        task_id,
+        tenant_id,
+        artifact_id,
+        runtime_pack
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let lease_id = Uuid::new_v4();
+    sqlx::query!(
+        "INSERT INTO task_leases (id, task_id, executor_id, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '1 minute')",
+        lease_id,
+        task_id,
+        executor.id
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let request = LiveLogChunkRequest {
+        lease_id,
+        executor_id: executor.id,
+        stream: "stdout".to_string(),
+        chunk: "replay me".to_string(),
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/tasks/{task_id}/logs/append"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/v1/tasks/{task_id}/logs"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"[stdout] replay me");
 }

@@ -26,6 +26,8 @@ async fn main() {
     let s3_access_key = env::var("HELIXIS_S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
     let s3_secret_key = env::var("HELIXIS_S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
     let output_bucket = env::var("HELIXIS_OUTPUT_BUCKET").unwrap_or_else(|_| "task-outputs".into());
+    let artifact_bucket =
+        env::var("HELIXIS_ARTIFACT_BUCKET").unwrap_or_else(|_| "artifacts".into());
 
     let pool = db::create_pool(&db_url)
         .await
@@ -39,6 +41,12 @@ async fn main() {
         .unwrap_or_else(|_| "dev-only-insecure-key-change-me".to_string());
     let secret_repo = Arc::new(PostgresSecretRepository::new(pool, &secret_key));
     let output_store = build_s3_store(&s3_endpoint, &s3_access_key, &s3_secret_key, &output_bucket);
+    let artifact_store = build_s3_store(
+        &s3_endpoint,
+        &s3_access_key,
+        &s3_secret_key,
+        &artifact_bucket,
+    );
 
     let reconciler_repo = Arc::clone(&task_repo);
     tokio::spawn(async move {
@@ -60,6 +68,7 @@ async fn main() {
         rate_limit_repo,
         secret_repo,
         output_store,
+        artifact_store,
         log_hub: Arc::new(LiveLogHub::new()),
     });
     let app = app_router(state);
