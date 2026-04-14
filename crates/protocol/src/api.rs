@@ -50,4 +50,7 @@ pub struct TaskStatusUpdateRequest {
     pub status: String,
     pub lease_id: Uuid,
     pub executor_id: Uuid,
+    pub logs_ref: Option<String>,
+    pub result_ref: Option<String>,
+    pub last_error_message: Option<String>,
 }

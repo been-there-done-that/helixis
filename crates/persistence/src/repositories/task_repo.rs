@@ -179,6 +179,28 @@ impl TaskRepository for PostgresTaskRepository {
             ));
         }
 
+        let executor_fresh = sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM executors
+                WHERE id = $1
+                  AND last_heartbeat_at >= NOW() - INTERVAL '60 seconds'
+            )
+            "#,
+            executor_id
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?
+        .unwrap_or(false);
+
+        if !executor_fresh {
+            return Err(RepositoryError::Conflict(
+                "executor heartbeat is stale".to_string(),
+            ));
+        }
+
         // Use a simple string building approach for the interval
         let query_str = format!(
             "INSERT INTO task_leases (id, task_id, executor_id, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '{} seconds')",
@@ -227,6 +249,9 @@ impl TaskRepository for PostgresTaskRepository {
         lease_id: Uuid,
         executor_id: Uuid,
         status: TaskStatus,
+        logs_ref: Option<String>,
+        result_ref: Option<String>,
+        last_error_message: Option<String>,
     ) -> Result<(), RepositoryError> {
         let status_str = match status {
             TaskStatus::Queued => "Queued",
@@ -330,11 +355,13 @@ impl TaskRepository for PostgresTaskRepository {
                 let result = sqlx::query!(
                     r#"
                     UPDATE tasks
-                    SET status = $1, updated_at = NOW()
+                    SET status = $1, result_ref = COALESCE($3, result_ref), last_error_message = $4, updated_at = NOW()
                     WHERE id = $2
                     "#,
                     status_str,
-                    id
+                    id,
+                    result_ref,
+                    last_error_message
                 )
                 .execute(&mut *tx)
                 .await
@@ -347,12 +374,14 @@ impl TaskRepository for PostgresTaskRepository {
                 sqlx::query!(
                     r#"
                     UPDATE task_attempts
-                    SET finished_at = NOW(), exit_reason = $1
+                    SET finished_at = NOW(), exit_reason = $1, logs_ref = COALESCE($3, logs_ref), result_ref = COALESCE($4, result_ref)
                     WHERE lease_id = $2
                       AND finished_at IS NULL
                     "#,
                     status_str,
-                    lease_id
+                    lease_id,
+                    logs_ref,
+                    result_ref
                 )
                 .execute(&mut *tx)
                 .await
@@ -449,5 +478,38 @@ impl TaskRepository for PostgresTaskRepository {
             .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
 
         Ok(expired.len() as u64)
+    }
+
+    async fn cancel_task(&self, id: Uuid) -> Result<(), RepositoryError> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE tasks
+            SET status = 'Cancelled', cancel_requested_at = NOW(), updated_at = NOW()
+            WHERE id = $1
+              AND status NOT IN ('Succeeded', 'Failed', 'Cancelled', 'TimedOut', 'DeadLetter')
+            "#,
+            id
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+        if result.rows_affected() > 0 {
+            return Ok(());
+        }
+
+        let exists = sqlx::query_scalar!("SELECT EXISTS (SELECT 1 FROM tasks WHERE id = $1)", id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?
+            .unwrap_or(false);
+
+        if exists {
+            Err(RepositoryError::Conflict(
+                "task is already terminal".to_string(),
+            ))
+        } else {
+            Err(RepositoryError::NotFound)
+        }
     }
 }

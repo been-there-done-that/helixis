@@ -199,13 +199,36 @@ pub async fn update_task_status(
 
     match state
         .task_repo
-        .update_task_status(id, payload.lease_id, payload.executor_id, status)
+        .update_task_status(
+            id,
+            payload.lease_id,
+            payload.executor_id,
+            status,
+            payload.logs_ref,
+            payload.result_ref,
+            payload.last_error_message,
+        )
         .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(RepositoryError::Conflict(_)) => StatusCode::CONFLICT.into_response(),
         Err(e) => {
             tracing::error!("Database error during status update: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn cancel_task(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    match state.task_repo.cancel_task(id).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(RepositoryError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(RepositoryError::Conflict(_)) => StatusCode::CONFLICT.into_response(),
+        Err(e) => {
+            tracing::error!("Database error during cancellation: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

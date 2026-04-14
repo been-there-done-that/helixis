@@ -69,24 +69,50 @@ async fn main() {
                 consecutive_empty_polls = 0;
                 tracing::info!("Acquired task {}! Executing now...", task.id);
 
-                if let Err(err) = client.report_status(task.id, lease.id, "Running").await {
+                if let Err(err) = client
+                    .report_status(task.id, lease.id, "Running", None, None, None)
+                    .await
+                {
                     tracing::error!("Failed to mark task {} as running: {}", task.id, err);
                     sleep(Duration::from_secs(1)).await;
                     continue;
                 }
 
                 // Execute mock task
-                match sandbox.execute(&task).await {
-                    Ok(_) => {
-                        tracing::info!("Execution Succeeded. Reporting status to cplane...");
-                        if let Err(e) = client.report_status(task.id, lease.id, "Succeeded").await
+                match sandbox.execute(&task, &lease, Arc::clone(&client)).await {
+                    Ok(outcome) => {
+                        let status_name = format!("{:?}", outcome.status);
+                        tracing::info!(
+                            "Execution finished with status {}. Reporting to cplane...",
+                            status_name
+                        );
+                        if let Err(e) = client
+                            .report_status(
+                                task.id,
+                                lease.id,
+                                &status_name,
+                                outcome.logs_ref,
+                                outcome.result_ref,
+                                outcome.last_error_message,
+                            )
+                            .await
                         {
-                            tracing::error!("Failed to report Succeeded status: {}", e);
+                            tracing::error!("Failed to report {} status: {}", status_name, e);
                         }
                     }
                     Err(e) => {
-                        tracing::error!("Execution Failed: {}. Reporting status to cplane...", e);
-                        if let Err(err) = client.report_status(task.id, lease.id, "Failed").await {
+                        tracing::error!("Execution infrastructure failed: {}. Reporting failure...", e);
+                        if let Err(err) = client
+                            .report_status(
+                                task.id,
+                                lease.id,
+                                "Failed",
+                                None,
+                                None,
+                                Some(e),
+                            )
+                            .await
+                        {
                             tracing::error!("Failed to report Failed status: {}", err);
                         }
                     }

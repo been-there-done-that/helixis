@@ -1,4 +1,4 @@
-use domain::{Task, TaskLease};
+use domain::{Task, TaskLease, TaskStatus};
 use protocol::api::{
     HeartbeatRequest, PollRequest, PollResponse, RegisterExecutorRequest, TaskStatusUpdateRequest,
 };
@@ -110,6 +110,9 @@ impl CplaneClient {
         task_id: Uuid,
         lease_id: Uuid,
         status: &str,
+        logs_ref: Option<String>,
+        result_ref: Option<String>,
+        last_error_message: Option<String>,
     ) -> Result<(), ClientError> {
         let url = self
             .base_url
@@ -120,6 +123,9 @@ impl CplaneClient {
             status: status.to_string(),
             lease_id,
             executor_id: self.executor_id,
+            logs_ref,
+            result_ref,
+            last_error_message,
         };
 
         self.client
@@ -130,5 +136,16 @@ impl CplaneClient {
             .error_for_status()?;
 
         Ok(())
+    }
+
+    pub async fn get_task_status(&self, task_id: Uuid) -> Result<TaskStatus, ClientError> {
+        let url = self
+            .base_url
+            .join(&format!("/v1/tasks/{task_id}"))
+            .map_err(|e| ClientError::Url(e.to_string()))?;
+
+        let response = self.client.get(url).send().await?.error_for_status()?;
+        let task_response: protocol::api::TaskResponse = response.json().await?;
+        Ok(task_response.status)
     }
 }

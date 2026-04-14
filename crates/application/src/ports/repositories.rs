@@ -32,9 +32,14 @@ pub trait TaskRepository: Send + Sync {
         lease_id: Uuid,
         executor_id: Uuid,
         status: TaskStatus,
+        logs_ref: Option<String>,
+        result_ref: Option<String>,
+        last_error_message: Option<String>,
     ) -> Result<(), RepositoryError>;
 
     async fn requeue_expired_leases(&self) -> Result<u64, RepositoryError>;
+
+    async fn cancel_task(&self, id: Uuid) -> Result<(), RepositoryError>;
 }
 
 #[async_trait]
