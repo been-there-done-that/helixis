@@ -1,13 +1,17 @@
 use application::ports::repositories::{
-    ArtifactRepository, ExecutorRepository, RateLimitRepository, SecretRepository, TaskRepository,
+    ArtifactRepository, ExecutorRepository, PayloadRepository, RateLimitRepository,
+    SecretRepository, TaskRepository,
 };
-use domain::{ArtifactStatus, ArtifactUploadStatus, Executor, Task, TaskStatus};
+use domain::{
+    ArtifactStatus, ArtifactUploadStatus, Executor, PayloadStatus, PayloadUploadStatus, Task,
+    TaskStatus,
+};
 use persistence::{
     db,
     repositories::{
         artifact::PostgresArtifactRepository, executor::PostgresExecutorRepository,
-        rate_limit::PostgresRateLimitRepository, secret::PostgresSecretRepository,
-        task::PostgresTaskRepository,
+        payload::PostgresPayloadRepository, rate_limit::PostgresRateLimitRepository,
+        secret::PostgresSecretRepository, task::PostgresTaskRepository,
     },
 };
 use sqlx::PgPool;
@@ -375,6 +379,36 @@ async fn test_artifact_round_trip() {
         .unwrap();
     assert_eq!(completed.status, ArtifactStatus::Ready);
     assert_eq!(completed.object_key.as_deref(), Some("artifacts/test"));
+}
+
+#[tokio::test]
+async fn test_payload_round_trip() {
+    let pool = setup_db().await;
+    let (tenant_id, _, _) = insert_prereqs(&pool).await;
+    let payload_repo = PostgresPayloadRepository::new(pool.clone());
+
+    let payload = domain::PayloadObject {
+        id: Uuid::new_v4(),
+        tenant_id,
+        digest: format!("sha256:{}", Uuid::new_v4()),
+        size_bytes: 24,
+        status: PayloadStatus::PendingUpload,
+        object_key: None,
+    };
+
+    let session = payload_repo.create_payload_upload(&payload).await.unwrap();
+    assert_eq!(session.status, PayloadUploadStatus::Pending);
+
+    let fetched = payload_repo.get_payload(payload.id).await.unwrap().unwrap();
+    assert_eq!(fetched.status, PayloadStatus::PendingUpload);
+    assert_eq!(fetched.digest, payload.digest);
+
+    let completed = payload_repo
+        .complete_payload_upload(session.id, "payloads/test.json")
+        .await
+        .unwrap();
+    assert_eq!(completed.status, PayloadStatus::Ready);
+    assert_eq!(completed.object_key.as_deref(), Some("payloads/test.json"));
 }
 
 #[tokio::test]
