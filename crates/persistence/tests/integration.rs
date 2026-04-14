@@ -1,7 +1,7 @@
 use application::ports::repositories::{
     ArtifactRepository, ExecutorRepository, RateLimitRepository, SecretRepository, TaskRepository,
 };
-use domain::{Executor, Task, TaskStatus};
+use domain::{ArtifactStatus, ArtifactUploadStatus, Executor, Task, TaskStatus};
 use persistence::{
     db,
     repositories::{
@@ -49,10 +49,14 @@ async fn insert_prereqs(pool: &PgPool) -> (Uuid, Uuid, String) {
     .await
     .unwrap();
 
-    sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
-        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack_id
+    sqlx::query(
+        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes, status, object_key) VALUES ($1, $2, $3, $4, 'main.py', 100, 'Ready', $5)",
     )
+    .bind(artifact_id)
+    .bind(tenant_id)
+    .bind(Uuid::new_v4().to_string())
+    .bind(&runtime_pack_id)
+    .bind(format!("artifacts/{artifact_id}"))
     .execute(pool)
     .await
     .unwrap();
@@ -347,15 +351,30 @@ async fn test_artifact_round_trip() {
         runtime_pack_id,
         entrypoint: "main.py".to_string(),
         size_bytes: 42,
+        status: ArtifactStatus::PendingUpload,
+        object_key: None,
     };
 
-    artifact_repo.insert_artifact(&artifact).await.unwrap();
+    let session = artifact_repo
+        .create_artifact_upload(&artifact)
+        .await
+        .unwrap();
+    assert_eq!(session.status, ArtifactUploadStatus::Pending);
+
     let fetched = artifact_repo
         .get_artifact(artifact.id)
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(fetched.status, ArtifactStatus::PendingUpload);
     assert_eq!(fetched.digest, artifact.digest);
+
+    let completed = artifact_repo
+        .complete_artifact_upload(session.id, "artifacts/test")
+        .await
+        .unwrap();
+    assert_eq!(completed.status, ArtifactStatus::Ready);
+    assert_eq!(completed.object_key.as_deref(), Some("artifacts/test"));
 }
 
 #[tokio::test]
