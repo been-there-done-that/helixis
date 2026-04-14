@@ -3,7 +3,8 @@ resolver = "3"
 members = [
     "apps/*",
     "crates/*",
-    "xtask"
+    "xtask",
+    "crates/telemetry",
 ]
 
 [workspace.dependencies]
