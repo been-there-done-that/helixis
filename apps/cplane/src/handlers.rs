@@ -11,7 +11,22 @@ use protocol::api::{
 };
 use serde_json::json;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+pub async fn health() -> impl IntoResponse {
+    let uptime = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let body = json!({
+        "status": "healthy",
+        "uptime_seconds": uptime,
+    });
+
+    (StatusCode::OK, Json(body))
+}
 
 pub struct AppState {
     pub task_repo: Arc<dyn TaskRepository>,

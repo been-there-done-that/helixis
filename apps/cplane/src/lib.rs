@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 pub fn app_router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/health", get(handlers::health))
         .route("/v1/tasks", post(submit_task))
         .route("/v1/tasks/:id", get(handlers::get_task))
         .route("/v1/tasks/:id/cancel", post(handlers::cancel_task))
