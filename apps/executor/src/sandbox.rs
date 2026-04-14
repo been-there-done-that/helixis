@@ -56,7 +56,7 @@ impl TaskSandbox for ProcessSandbox {
 
         let cache_dir = self
             .downloader
-            .ensure_artifact_cached(task.artifact_id)
+            .ensure_artifact_cached(artifact)
             .await
             .map_err(|e| format!("Failed to fetch artifact: {}", e))?;
 

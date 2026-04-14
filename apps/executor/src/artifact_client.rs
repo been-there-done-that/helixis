@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use domain::Artifact;
 use object_store::aws::AmazonS3Builder;
 use object_store::{ObjectStore, path::Path as StorePath};
 use std::path::{Component, Path, PathBuf};
@@ -44,19 +45,22 @@ impl ArtifactDownloader {
 
     pub async fn ensure_artifact_cached(
         &self,
-        artifact_id: Uuid,
+        artifact: &Artifact,
     ) -> Result<PathBuf, ArtifactError> {
-        let object_key = format!("{}", artifact_id);
-        let cache_dir = Path::new("/tmp/helixis/cache/artifacts").join(&object_key);
+        let object_key = artifact
+            .object_key
+            .clone()
+            .ok_or_else(|| ArtifactError::InvalidArchive("artifact missing object key".into()))?;
+        let cache_dir = Path::new("/tmp/helixis/cache/artifacts").join(artifact.id.to_string());
 
         if fs::try_exists(&cache_dir).await? {
-            tracing::debug!("Artifact {} found in cache. Warm start!", artifact_id);
+            tracing::debug!("Artifact {} found in cache. Warm start!", artifact.id);
             return Ok(cache_dir);
         }
 
         tracing::info!(
             "Cache miss for {}. Fetching object: s3://{}/{}",
-            artifact_id,
+            artifact.id,
             self.bucket,
             object_key
         );
@@ -118,7 +122,7 @@ impl ArtifactDownloader {
 
         tracing::info!(
             "Successfully unpacked artifact {} to {:?}",
-            artifact_id,
+            artifact.id,
             cache_dir
         );
 
