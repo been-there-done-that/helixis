@@ -2,9 +2,16 @@
 resolver = "3"
 members = [
     "apps/*",
-    "crates/*",
-    "xtask",
+    "crates/application",
+    "crates/config",
+    "crates/domain",
+    "crates/persistence",
+    "crates/protocol",
     "crates/telemetry",
+    "crates/runtime/core",
+    "crates/runtime/python",
+    "crates/runtime/node",
+    "xtask",
 ]
 
 [workspace.dependencies]
