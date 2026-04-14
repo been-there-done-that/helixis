@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use domain::{Artifact, Executor, Task, TaskLease, TaskOutputs, TaskStatus};
+use domain::{Artifact, ArtifactUploadSession, Executor, Task, TaskLease, TaskOutputs, TaskStatus};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
@@ -62,8 +62,20 @@ pub trait ExecutorRepository: Send + Sync {
 
 #[async_trait]
 pub trait ArtifactRepository: Send + Sync {
-    async fn insert_artifact(&self, artifact: &Artifact) -> Result<(), RepositoryError>;
+    async fn create_artifact_upload(
+        &self,
+        artifact: &Artifact,
+    ) -> Result<ArtifactUploadSession, RepositoryError>;
     async fn get_artifact(&self, id: Uuid) -> Result<Option<Artifact>, RepositoryError>;
+    async fn get_upload_session(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<ArtifactUploadSession>, RepositoryError>;
+    async fn complete_artifact_upload(
+        &self,
+        session_id: Uuid,
+        object_key: &str,
+    ) -> Result<Artifact, RepositoryError>;
 }
 
 #[async_trait]
