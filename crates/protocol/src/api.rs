@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use domain::{Artifact, Task, TaskLease};
+use domain::{Artifact, ArtifactUploadSession, Task, TaskLease};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -25,7 +25,7 @@ pub struct TaskResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ArtifactRegisterRequest {
+pub struct ArtifactUploadCreateRequest {
     pub tenant_id: Uuid,
     pub digest: String,
     pub runtime_pack_id: String,
@@ -36,6 +36,12 @@ pub struct ArtifactRegisterRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ArtifactResponse {
     pub artifact: Artifact,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ArtifactUploadSessionResponse {
+    pub artifact: Artifact,
+    pub upload_session: ArtifactUploadSession,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

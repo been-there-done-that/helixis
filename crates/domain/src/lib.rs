@@ -38,6 +38,12 @@ pub struct RuntimePack {
     pub sandbox_kind: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ArtifactStatus {
+    PendingUpload,
+    Ready,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
     pub id: Uuid,
@@ -46,6 +52,21 @@ pub struct Artifact {
     pub runtime_pack_id: String,
     pub entrypoint: String,
     pub size_bytes: i64,
+    pub status: ArtifactStatus,
+    pub object_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ArtifactUploadStatus {
+    Pending,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactUploadSession {
+    pub id: Uuid,
+    pub artifact_id: Uuid,
+    pub status: ArtifactUploadStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
