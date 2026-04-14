@@ -69,6 +69,35 @@ pub struct ArtifactUploadSession {
     pub status: ArtifactUploadStatus,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PayloadStatus {
+    PendingUpload,
+    Ready,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PayloadObject {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub digest: String,
+    pub size_bytes: i64,
+    pub status: PayloadStatus,
+    pub object_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PayloadUploadStatus {
+    Pending,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PayloadUploadSession {
+    pub id: Uuid,
+    pub payload_id: Uuid,
+    pub status: PayloadUploadStatus,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskOutputs {
     pub task_id: Uuid,
