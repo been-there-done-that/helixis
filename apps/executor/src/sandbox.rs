@@ -1,13 +1,16 @@
 use crate::artifact_client::ArtifactDownloader;
 use crate::client::CplaneClient;
+use crate::output_store::OutputUploader;
+use crate::runtime::RuntimeAdapter;
 use domain::{Task, TaskLease, TaskStatus};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::time::{Duration, interval};
+use tokio::time::{Duration, interval, sleep};
 
 pub struct ExecutionOutcome {
     pub status: TaskStatus,
@@ -24,13 +27,14 @@ pub trait TaskSandbox {
         lease: &TaskLease,
         client: Arc<CplaneClient>,
         environment: BTreeMap<String, String>,
+        payload: Option<Value>,
     ) -> Result<ExecutionOutcome, String>;
 }
 
 pub struct ProcessSandbox {
     pub downloader: ArtifactDownloader,
-    pub command: String,
-    pub entrypoint: String,
+    pub output_uploader: OutputUploader,
+    pub runtime: Box<dyn RuntimeAdapter>,
 }
 
 #[async_trait::async_trait]
@@ -41,6 +45,7 @@ impl TaskSandbox for ProcessSandbox {
         lease: &TaskLease,
         client: Arc<CplaneClient>,
         environment: BTreeMap<String, String>,
+        payload: Option<Value>,
     ) -> Result<ExecutionOutcome, String> {
         tracing::info!(
             "ProcessSandbox: Checking S3 artifact cache for [{}]...",
@@ -53,7 +58,7 @@ impl TaskSandbox for ProcessSandbox {
             .await
             .map_err(|e| format!("Failed to fetch artifact: {}", e))?;
 
-        let run_dir = Path::new("/tmp/helixis/tasks").join(format!("{}", task.id));
+        let run_dir = Path::new("/tmp/helixis/tasks").join(task.id.to_string());
         if tokio::fs::try_exists(&run_dir)
             .await
             .map_err(|e| e.to_string())?
@@ -66,51 +71,53 @@ impl TaskSandbox for ProcessSandbox {
             .await
             .map_err(|e| e.to_string())?;
         copy_dir_recursive(&cache_dir, &run_dir).await?;
+        let payload_path = materialize_payload(&run_dir, payload).await?;
 
-        let artifact_dir = Path::new("/tmp/helixis/task-artifacts")
-            .join(task.id.to_string())
-            .join(lease.id.to_string());
-        tokio::fs::create_dir_all(&artifact_dir)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        tracing::info!(
-            "ProcessSandbox: Executing task [{}] via command spawn...",
-            task.id
-        );
-
-        let entrypoint = run_dir.join(&self.entrypoint);
-
-        let mut child = Command::new(&self.command)
-            .arg(entrypoint)
+        let mut command: Command = self.runtime.build_command(&run_dir);
+        command
             .current_dir(&run_dir)
             .env("TASK_WORKSPACE", &run_dir)
             .envs(environment)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        if let Some(payload_path) = &payload_path {
+            command.env("TASK_PAYLOAD_PATH", payload_path);
+        }
+
+        let mut child = command
             .spawn()
             .map_err(|e| format!("Failed to spawn process: {}", e))?;
 
-        let mut stdout = child
+        let stdout = child
             .stdout
             .take()
             .ok_or_else(|| "Failed to capture stdout pipe".to_string())?;
-        let mut stderr = child
+        let stderr = child
             .stderr
             .take()
             .ok_or_else(|| "Failed to capture stderr pipe".to_string())?;
 
-        let stdout_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            stdout.read_to_end(&mut buf).await.map(|_| buf)
-        });
-        let stderr_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            stderr.read_to_end(&mut buf).await.map(|_| buf)
-        });
+        let stdout_task = tokio::spawn(stream_and_capture(
+            stdout,
+            "stdout",
+            Arc::clone(&client),
+            task.id,
+            lease.id,
+        ));
+        let stderr_task = tokio::spawn(stream_and_capture(
+            stderr,
+            "stderr",
+            Arc::clone(&client),
+            task.id,
+            lease.id,
+        ));
 
         let mut cancel_ticker = interval(Duration::from_secs(1));
         let mut cancelled = false;
+        let mut timed_out = false;
+        let timeout = sleep(Duration::from_secs(task.timeout_seconds.max(1) as u64));
+        tokio::pin!(timeout);
 
         loop {
             tokio::select! {
@@ -118,19 +125,18 @@ impl TaskSandbox for ProcessSandbox {
                     let status = status.map_err(|e| format!("Failed while waiting for process: {}", e))?;
                     let stdout_bytes = stdout_task
                         .await
-                        .map_err(|e| e.to_string())?
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| e.to_string())??;
                     let stderr_bytes = stderr_task
                         .await
-                        .map_err(|e| e.to_string())?
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| e.to_string())??;
 
                     let outcome = build_outcome(
+                        &self.output_uploader,
                         task,
                         lease,
-                        &artifact_dir,
                         status.code(),
                         cancelled,
+                        timed_out,
                         stdout_bytes,
                         stderr_bytes,
                     )
@@ -143,29 +149,58 @@ impl TaskSandbox for ProcessSandbox {
                     return Ok(outcome);
                 }
                 _ = cancel_ticker.tick() => {
-                    match client.get_task_status(task.id).await {
-                        Ok(TaskStatus::Cancelled) => {
-                            tracing::info!("Cancellation requested for task {}. Stopping process.", task.id);
-                            cancelled = true;
-                            child.kill().await.map_err(|e| format!("Failed to kill process: {}", e))?;
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            tracing::warn!("Failed to check task status for cancellation: {}", err);
+                    if !cancelled && !timed_out {
+                        match client.get_task_status(task.id).await {
+                            Ok(TaskStatus::Cancelled) => {
+                                tracing::info!("Cancellation requested for task {}. Stopping process.", task.id);
+                                cancelled = true;
+                                child.kill().await.map_err(|e| format!("Failed to kill process: {}", e))?;
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                tracing::warn!("Failed to check task status for cancellation: {}", err);
+                            }
                         }
                     }
+                }
+                _ = &mut timeout, if !cancelled && !timed_out => {
+                    tracing::warn!(
+                        "Task {} exceeded timeout of {} seconds",
+                        task.id,
+                        task.timeout_seconds
+                    );
+                    timed_out = true;
+                    child.kill()
+                        .await
+                        .map_err(|e| format!("Failed to kill timed-out process: {}", e))?;
                 }
             }
         }
     }
 }
 
+async fn materialize_payload(
+    run_dir: &Path,
+    payload: Option<Value>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+
+    let payload_path = run_dir.join("payload.json");
+    tokio::fs::write(&payload_path, payload.to_string())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(payload_path))
+}
+
 async fn build_outcome(
+    output_uploader: &OutputUploader,
     task: &Task,
     lease: &TaskLease,
-    artifact_dir: &Path,
     exit_code: Option<i32>,
     cancelled: bool,
+    timed_out: bool,
     stdout_bytes: Vec<u8>,
     stderr_bytes: Vec<u8>,
 ) -> Result<ExecutionOutcome, String> {
@@ -173,12 +208,9 @@ async fn build_outcome(
     let stderr = String::from_utf8_lossy(&stderr_bytes);
     let combined_logs = format!("--- stdout ---\n{}\n--- stderr ---\n{}\n", stdout, stderr);
 
-    let logs_path = artifact_dir.join("logs.txt");
-    tokio::fs::write(&logs_path, combined_logs)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let status = if cancelled {
+    let status = if timed_out {
+        TaskStatus::TimedOut
+    } else if cancelled {
         TaskStatus::Cancelled
     } else if exit_code == Some(0) {
         TaskStatus::Succeeded
@@ -198,6 +230,10 @@ async fn build_outcome(
                 format!(": {}", stderr.trim())
             }
         )),
+        TaskStatus::TimedOut => Some(format!(
+            "Execution exceeded timeout of {} seconds",
+            task.timeout_seconds
+        )),
         TaskStatus::Cancelled => Some("Execution cancelled by control plane".to_string()),
         _ => None,
     };
@@ -208,19 +244,54 @@ async fn build_outcome(
         "status": format!("{:?}", status),
         "exit_code": exit_code,
         "cancelled": cancelled,
+        "timed_out": timed_out,
     });
 
-    let result_path = artifact_dir.join("result.json");
-    tokio::fs::write(&result_path, result_json.to_string())
+    let (logs_ref, result_ref) = output_uploader
+        .upload_outputs(task.id, lease.id, combined_logs, result_json.to_string())
         .await
         .map_err(|e| e.to_string())?;
 
     Ok(ExecutionOutcome {
         status,
-        logs_ref: Some(logs_path.to_string_lossy().into_owned()),
-        result_ref: Some(result_path.to_string_lossy().into_owned()),
+        logs_ref: Some(logs_ref),
+        result_ref: Some(result_ref),
         last_error_message,
     })
+}
+
+async fn stream_and_capture<R>(
+    mut reader: R,
+    stream_name: &'static str,
+    client: Arc<CplaneClient>,
+    task_id: uuid::Uuid,
+    lease_id: uuid::Uuid,
+) -> Result<Vec<u8>, String>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let mut all = Vec::new();
+    let mut buf = [0u8; 4096];
+
+    loop {
+        let read = reader.read(&mut buf).await.map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+
+        let chunk = &buf[..read];
+        all.extend_from_slice(chunk);
+
+        let chunk_text = String::from_utf8_lossy(chunk).to_string();
+        if let Err(err) = client
+            .append_log_chunk(task_id, lease_id, stream_name, chunk_text)
+            .await
+        {
+            tracing::warn!("Failed to append live log chunk: {}", err);
+        }
+    }
+
+    Ok(all)
 }
 
 async fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {

@@ -1,8 +1,10 @@
 use domain::{Task, TaskLease, TaskStatus};
 use protocol::api::{
-    HeartbeatRequest, PollRequest, PollResponse, RegisterExecutorRequest, TaskStatusUpdateRequest,
+    HeartbeatRequest, LiveLogChunkRequest, PollRequest, PollResponse, RegisterExecutorRequest,
+    TaskStatusUpdateRequest,
 };
 use reqwest::{Client, Url};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
@@ -77,7 +79,8 @@ impl CplaneClient {
         &self,
         runtime_pack_id: &str,
         lease_duration_sec: i32,
-    ) -> Result<Option<(Task, TaskLease, BTreeMap<String, String>)>, ClientError> {
+    ) -> Result<Option<(Task, TaskLease, BTreeMap<String, String>, Option<Value>)>, ClientError>
+    {
         let url = self
             .base_url
             .join("/v1/executors/poll")
@@ -100,7 +103,12 @@ impl CplaneClient {
         let poll_response: PollResponse = response.json().await?;
 
         if let (Some(task), Some(lease)) = (poll_response.task, poll_response.lease) {
-            Ok(Some((task, lease, poll_response.environment)))
+            Ok(Some((
+                task,
+                lease,
+                poll_response.environment,
+                poll_response.payload,
+            )))
         } else {
             Ok(None)
         }
@@ -148,5 +156,34 @@ impl CplaneClient {
         let response = self.client.get(url).send().await?.error_for_status()?;
         let task_response: protocol::api::TaskResponse = response.json().await?;
         Ok(task_response.status)
+    }
+
+    pub async fn append_log_chunk(
+        &self,
+        task_id: Uuid,
+        lease_id: Uuid,
+        stream: &str,
+        chunk: String,
+    ) -> Result<(), ClientError> {
+        let url = self
+            .base_url
+            .join(&format!("/v1/tasks/{task_id}/logs/append"))
+            .map_err(|e| ClientError::Url(e.to_string()))?;
+
+        let req = LiveLogChunkRequest {
+            lease_id,
+            executor_id: self.executor_id,
+            stream: stream.to_string(),
+            chunk,
+        };
+
+        self.client
+            .post(url)
+            .json(&req)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        Ok(())
     }
 }
