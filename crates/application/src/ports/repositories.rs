@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use domain::{Executor, Task, TaskLease, TaskStatus};
+use domain::{Artifact, Executor, Task, TaskLease, TaskOutputs, TaskStatus};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
@@ -16,6 +16,7 @@ pub enum RepositoryError {
 #[async_trait]
 pub trait TaskRepository: Send + Sync {
     async fn get_task(&self, id: Uuid) -> Result<Option<Task>, RepositoryError>;
+    async fn get_task_outputs(&self, id: Uuid) -> Result<Option<TaskOutputs>, RepositoryError>;
 
     async fn insert_task(&self, task: &Task) -> Result<(), RepositoryError>;
 
@@ -47,6 +48,12 @@ pub trait TaskRepository: Send + Sync {
 pub trait ExecutorRepository: Send + Sync {
     async fn upsert_executor(&self, executor: &Executor) -> Result<(), RepositoryError>;
     async fn record_heartbeat(&self, id: Uuid) -> Result<(), RepositoryError>;
+}
+
+#[async_trait]
+pub trait ArtifactRepository: Send + Sync {
+    async fn insert_artifact(&self, artifact: &Artifact) -> Result<(), RepositoryError>;
+    async fn get_artifact(&self, id: Uuid) -> Result<Option<Artifact>, RepositoryError>;
 }
 
 #[async_trait]
