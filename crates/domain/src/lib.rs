@@ -22,10 +22,12 @@ pub struct Task {
     pub status: TaskStatus,
     pub priority: i32,
     pub rate_limit_key: Option<String>,
+    pub payload_ref: Option<String>,
     pub timeout_seconds: i32,
     pub max_attempts: i32,
     pub current_attempt: i32,
     pub idempotency_key: Option<String>,
+    pub payload_size_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +46,14 @@ pub struct Artifact {
     pub runtime_pack_id: String,
     pub entrypoint: String,
     pub size_bytes: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskOutputs {
+    pub task_id: Uuid,
+    pub status: TaskStatus,
+    pub logs_ref: Option<String>,
+    pub result_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
