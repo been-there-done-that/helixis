@@ -1,18 +1,28 @@
 mod artifact_client;
 mod client;
 mod output_store;
-mod runtime;
 mod sandbox;
 
 use artifact_client::ArtifactDownloader;
 use client::CplaneClient;
 use output_store::OutputUploader;
-use runtime::runtime_adapter_for;
+use runtime_core::RuntimeAdapter;
+use runtime_node::NodeRuntimeAdapter;
+use runtime_python::PythonRuntimeAdapter;
 use sandbox::{ProcessSandbox, TaskSandbox};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
+
+fn runtime_adapter_for(runtime_pack_id: &str, default_command: String) -> Box<dyn RuntimeAdapter> {
+    if runtime_pack_id.starts_with("node") {
+        let binary = std::env::var("NODE_EXECUTOR_COMMAND").unwrap_or_else(|_| "node".to_string());
+        Box::new(NodeRuntimeAdapter::new(binary))
+    } else {
+        Box::new(PythonRuntimeAdapter::new(default_command))
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -57,11 +67,10 @@ async fn main() {
         std::env::var("RUNTIME_PACK_ID").unwrap_or_else(|_| "demo-python-pack".to_string());
     let runtime_pack_id = env_pack_id.clone();
     let command = std::env::var("EXECUTOR_COMMAND").unwrap_or_else(|_| "python3".to_string());
-    let entrypoint = std::env::var("EXECUTOR_ENTRYPOINT").unwrap_or_else(|_| "main.py".to_string());
     let sandbox = ProcessSandbox {
         downloader,
         output_uploader,
-        runtime: runtime_adapter_for(&runtime_pack_id, command, entrypoint),
+        runtime: runtime_adapter_for(&runtime_pack_id, command),
     };
 
     client
@@ -90,7 +99,7 @@ async fn main() {
         tracing::debug!("Polling queue...");
 
         match client.poll_task(&runtime_pack_id, 120).await {
-            Ok(Some((task, lease, environment, payload))) => {
+            Ok(Some((task, lease, artifact, environment, payload))) => {
                 consecutive_empty_polls = 0;
                 tracing::info!("Acquired task {}! Executing now...", task.id);
 
@@ -105,7 +114,14 @@ async fn main() {
 
                 // Execute mock task
                 match sandbox
-                    .execute(&task, &lease, Arc::clone(&client), environment, payload)
+                    .execute(
+                        &task,
+                        &lease,
+                        &artifact,
+                        Arc::clone(&client),
+                        environment,
+                        payload,
+                    )
                     .await
                 {
                     Ok(outcome) => {

@@ -1,4 +1,4 @@
-use domain::{Task, TaskLease, TaskStatus};
+use domain::{Artifact, Task, TaskLease, TaskStatus};
 use protocol::api::{
     HeartbeatRequest, LiveLogChunkRequest, PollRequest, PollResponse, RegisterExecutorRequest,
     TaskStatusUpdateRequest,
@@ -79,8 +79,16 @@ impl CplaneClient {
         &self,
         runtime_pack_id: &str,
         lease_duration_sec: i32,
-    ) -> Result<Option<(Task, TaskLease, BTreeMap<String, String>, Option<Value>)>, ClientError>
-    {
+    ) -> Result<
+        Option<(
+            Task,
+            TaskLease,
+            Artifact,
+            BTreeMap<String, String>,
+            Option<Value>,
+        )>,
+        ClientError,
+    > {
         let url = self
             .base_url
             .join("/v1/executors/poll")
@@ -102,10 +110,15 @@ impl CplaneClient {
 
         let poll_response: PollResponse = response.json().await?;
 
-        if let (Some(task), Some(lease)) = (poll_response.task, poll_response.lease) {
+        if let (Some(task), Some(lease), Some(artifact)) = (
+            poll_response.task,
+            poll_response.lease,
+            poll_response.artifact,
+        ) {
             Ok(Some((
                 task,
                 lease,
+                artifact,
                 poll_response.environment,
                 poll_response.payload,
             )))

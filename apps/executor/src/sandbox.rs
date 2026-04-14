@@ -1,8 +1,8 @@
 use crate::artifact_client::ArtifactDownloader;
 use crate::client::CplaneClient;
 use crate::output_store::OutputUploader;
-use crate::runtime::RuntimeAdapter;
-use domain::{Task, TaskLease, TaskStatus};
+use domain::{Artifact, Task, TaskLease, TaskStatus};
+use runtime_core::RuntimeAdapter;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,7 @@ pub trait TaskSandbox {
         &self,
         task: &Task,
         lease: &TaskLease,
+        artifact: &Artifact,
         client: Arc<CplaneClient>,
         environment: BTreeMap<String, String>,
         payload: Option<Value>,
@@ -43,6 +44,7 @@ impl TaskSandbox for ProcessSandbox {
         &self,
         task: &Task,
         lease: &TaskLease,
+        artifact: &Artifact,
         client: Arc<CplaneClient>,
         environment: BTreeMap<String, String>,
         payload: Option<Value>,
@@ -73,7 +75,7 @@ impl TaskSandbox for ProcessSandbox {
         copy_dir_recursive(&cache_dir, &run_dir).await?;
         let payload_path = materialize_payload(&run_dir, payload).await?;
 
-        let mut command: Command = self.runtime.build_command(&run_dir);
+        let mut command: Command = self.runtime.build_command(&run_dir, artifact);
         command
             .current_dir(&run_dir)
             .env("TASK_WORKSPACE", &run_dir)
