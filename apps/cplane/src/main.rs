@@ -6,6 +6,7 @@ use cplane::storage::build_s3_store;
 use persistence::db;
 use persistence::repositories::artifact::PostgresArtifactRepository;
 use persistence::repositories::executor::PostgresExecutorRepository;
+use persistence::repositories::payload::PostgresPayloadRepository;
 use persistence::repositories::rate_limit::PostgresRateLimitRepository;
 use persistence::repositories::secret::PostgresSecretRepository;
 use persistence::repositories::task::PostgresTaskRepository;
@@ -35,6 +36,7 @@ async fn main() {
 
     let task_repo = Arc::new(PostgresTaskRepository::new(pool.clone()));
     let artifact_repo = Arc::new(PostgresArtifactRepository::new(pool.clone()));
+    let payload_repo = Arc::new(PostgresPayloadRepository::new(pool.clone()));
     let executor_repo = Arc::new(PostgresExecutorRepository::new(pool.clone()));
     let rate_limit_repo = Arc::new(PostgresRateLimitRepository::new(pool.clone()));
     let secret_key = env::var("HELIXIS_SECRETS_KEY")
@@ -64,6 +66,7 @@ async fn main() {
     let state = Arc::new(AppState {
         task_repo,
         artifact_repo,
+        payload_repo,
         executor_repo,
         rate_limit_repo,
         secret_repo,

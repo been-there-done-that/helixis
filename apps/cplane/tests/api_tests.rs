@@ -12,14 +12,15 @@ use persistence::{
     db,
     repositories::{
         artifact::PostgresArtifactRepository, executor::PostgresExecutorRepository,
-        rate_limit::PostgresRateLimitRepository, secret::PostgresSecretRepository,
-        task::PostgresTaskRepository,
+        payload::PostgresPayloadRepository, rate_limit::PostgresRateLimitRepository,
+        secret::PostgresSecretRepository, task::PostgresTaskRepository,
     },
 };
 use protocol::api::{
     ArtifactResponse, ArtifactUploadCreateRequest, ArtifactUploadSessionResponse, HeartbeatRequest,
-    LiveLogChunkRequest, PollRequest, PollResponse, PutRateLimitRequest, PutSecretRequest,
-    RegisterExecutorRequest, TaskResponse, TaskStatusUpdateRequest, TaskSubmitRequest,
+    LiveLogChunkRequest, PayloadResponse, PayloadUploadCreateRequest, PayloadUploadSessionResponse,
+    PollRequest, PollResponse, PutRateLimitRequest, PutSecretRequest, RegisterExecutorRequest,
+    TaskResponse, TaskStatusUpdateRequest, TaskSubmitRequest,
 };
 use sha2::{Digest, Sha256};
 use std::env;
@@ -68,6 +69,7 @@ fn build_state(pool: &sqlx::PgPool) -> Arc<AppState> {
     Arc::new(AppState {
         task_repo: Arc::new(PostgresTaskRepository::new(pool.clone())),
         artifact_repo: Arc::new(PostgresArtifactRepository::new(pool.clone())),
+        payload_repo: Arc::new(PostgresPayloadRepository::new(pool.clone())),
         executor_repo: Arc::new(PostgresExecutorRepository::new(pool.clone())),
         rate_limit_repo: Arc::new(PostgresRateLimitRepository::new(pool.clone())),
         secret_repo: Arc::new(PostgresSecretRepository::new(
@@ -127,6 +129,7 @@ async fn test_full_api_flow() {
         artifact_id,
         runtime_pack_id: runtime_pack.clone(),
         payload: None,
+        payload_upload_id: None,
         priority: Some(5),
         rate_limit_key: None,
         timeout_seconds: Some(100),
@@ -261,6 +264,7 @@ async fn test_reject_mismatched_artifact_runtime() {
         artifact_id,
         runtime_pack_id: other_runtime_pack,
         payload: None,
+        payload_upload_id: None,
         priority: Some(5),
         rate_limit_key: None,
         timeout_seconds: Some(100),
@@ -341,6 +345,7 @@ async fn test_cancel_endpoint_marks_task_cancelled() {
         artifact_id,
         runtime_pack_id: runtime_pack,
         payload: None,
+        payload_upload_id: None,
         priority: Some(1),
         rate_limit_key: None,
         timeout_seconds: Some(100),
@@ -448,6 +453,7 @@ async fn test_poll_includes_tenant_secrets() {
         artifact_id,
         runtime_pack_id: runtime_pack.clone(),
         payload: None,
+        payload_upload_id: None,
         priority: Some(1),
         rate_limit_key: None,
         timeout_seconds: Some(30),
@@ -551,6 +557,7 @@ async fn test_rate_limit_blocks_second_inflight_task() {
             artifact_id,
             runtime_pack_id: runtime_pack.clone(),
             payload: None,
+            payload_upload_id: None,
             priority: Some(1),
             rate_limit_key: Some("customer-123".to_string()),
             timeout_seconds: Some(30),
@@ -669,6 +676,7 @@ async fn test_upload_artifact_content_stores_blob() {
     let state = Arc::new(AppState {
         task_repo: Arc::new(PostgresTaskRepository::new(pool.clone())),
         artifact_repo: Arc::new(PostgresArtifactRepository::new(pool.clone())),
+        payload_repo: Arc::new(PostgresPayloadRepository::new(pool.clone())),
         executor_repo: Arc::new(PostgresExecutorRepository::new(pool.clone())),
         rate_limit_repo: Arc::new(PostgresRateLimitRepository::new(pool.clone())),
         secret_repo: Arc::new(PostgresSecretRepository::new(
@@ -681,13 +689,13 @@ async fn test_upload_artifact_content_stores_blob() {
     });
     let app = app_router(state);
 
-    let artifact_bytes = b"test".to_vec();
+    let artifact_bytes = format!("test-{}", Uuid::new_v4()).into_bytes();
     let register = ArtifactUploadCreateRequest {
         tenant_id,
         digest: format!("sha256:{:x}", Sha256::digest(&artifact_bytes)),
         runtime_pack_id: runtime_pack,
         entrypoint: "main.py".to_string(),
-        size_bytes: 4,
+        size_bytes: artifact_bytes.len() as i64,
     };
 
     let response = app
@@ -737,7 +745,7 @@ async fn test_upload_artifact_content_stores_blob() {
         .bytes()
         .await
         .unwrap();
-    assert_eq!(&bytes[..], b"test");
+    assert_eq!(&bytes[..], artifact_bytes.as_slice());
 }
 
 #[tokio::test]
@@ -775,6 +783,7 @@ async fn test_reject_task_submission_for_pending_artifact() {
         artifact_id: upload_response.artifact.id,
         runtime_pack_id: runtime_pack,
         payload: None,
+        payload_upload_id: None,
         priority: None,
         rate_limit_key: None,
         timeout_seconds: None,
@@ -798,6 +807,117 @@ async fn test_reject_task_submission_for_pending_artifact() {
 }
 
 #[tokio::test]
+async fn test_payload_upload_stores_blob_and_can_be_submitted() {
+    let pool = setup_db().await;
+    let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
+    let output_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = Arc::new(AppState {
+        task_repo: Arc::new(PostgresTaskRepository::new(pool.clone())),
+        artifact_repo: Arc::new(PostgresArtifactRepository::new(pool.clone())),
+        payload_repo: Arc::new(PostgresPayloadRepository::new(pool.clone())),
+        executor_repo: Arc::new(PostgresExecutorRepository::new(pool.clone())),
+        rate_limit_repo: Arc::new(PostgresRateLimitRepository::new(pool.clone())),
+        secret_repo: Arc::new(PostgresSecretRepository::new(
+            pool.clone(),
+            "test-secret-key",
+        )),
+        output_store: output_store.clone(),
+        artifact_store: Arc::new(InMemory::new()),
+        log_hub: Arc::new(LiveLogHub::new()),
+    });
+    let app = app_router(state);
+
+    let payload_bytes = serde_json::to_vec(&serde_json::json!({
+        "hello": "world",
+        "nonce": Uuid::new_v4().to_string()
+    }))
+    .unwrap();
+    let create_request = PayloadUploadCreateRequest {
+        tenant_id,
+        digest: format!("sha256:{:x}", Sha256::digest(&payload_bytes)),
+        size_bytes: payload_bytes.len() as i64,
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payload-uploads")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&create_request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let upload_response: PayloadUploadSessionResponse = serde_json::from_slice(&body).unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/payload-uploads/{}/content",
+                    upload_response.upload_session.id
+                ))
+                .body(Body::from(payload_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let payload_response: PayloadResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload_response.payload.status,
+        domain::PayloadStatus::Ready
+    );
+
+    let payload_blob = output_store
+        .get(&object_store::path::Path::from(format!(
+            "payloads/{}.json",
+            payload_response.payload.id
+        )))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&payload_blob[..], payload_bytes.as_slice());
+
+    let submit_req = TaskSubmitRequest {
+        tenant_id,
+        artifact_id,
+        runtime_pack_id: runtime_pack,
+        payload: None,
+        payload_upload_id: Some(payload_response.payload.id),
+        priority: Some(1),
+        rate_limit_key: None,
+        timeout_seconds: Some(30),
+        max_attempts: Some(1),
+        idempotency_key: None,
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&submit_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
 async fn test_task_output_retrieval_endpoints() {
     let pool = setup_db().await;
     let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
@@ -805,6 +925,7 @@ async fn test_task_output_retrieval_endpoints() {
     let state = Arc::new(AppState {
         task_repo: Arc::new(PostgresTaskRepository::new(pool.clone())),
         artifact_repo: Arc::new(PostgresArtifactRepository::new(pool.clone())),
+        payload_repo: Arc::new(PostgresPayloadRepository::new(pool.clone())),
         executor_repo: Arc::new(PostgresExecutorRepository::new(pool.clone())),
         rate_limit_repo: Arc::new(PostgresRateLimitRepository::new(pool.clone())),
         secret_repo: Arc::new(PostgresSecretRepository::new(
@@ -933,6 +1054,7 @@ async fn test_poll_includes_offloaded_payload() {
         artifact_id,
         runtime_pack_id: runtime_pack.clone(),
         payload: Some(serde_json::json!({"message":"hello","n":1})),
+        payload_upload_id: None,
         priority: Some(1),
         rate_limit_key: None,
         timeout_seconds: Some(30),

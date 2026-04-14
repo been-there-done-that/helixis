@@ -29,6 +29,11 @@ pub fn app_router(state: Arc<AppState>) -> Router {
             "/v1/artifact-uploads/:id/content",
             post(handlers::upload_artifact_content),
         )
+        .route("/v1/payload-uploads", post(handlers::create_payload_upload))
+        .route(
+            "/v1/payload-uploads/:id/content",
+            post(handlers::upload_payload_content),
+        )
         .route("/v1/secrets", post(handlers::put_secret))
         .route("/v1/rate-limits", post(handlers::put_rate_limit))
         .route("/v1/executors/register", post(handlers::register_executor))

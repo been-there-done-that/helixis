@@ -1,6 +1,6 @@
 use application::ports::repositories::{
-    ArtifactRepository, ExecutorRepository, RateLimitRepository, RepositoryError, SecretRepository,
-    TaskRepository,
+    ArtifactRepository, ExecutorRepository, PayloadRepository, RateLimitRepository,
+    RepositoryError, SecretRepository, TaskRepository,
 };
 use axum::{
     Json,
@@ -16,8 +16,9 @@ use axum::{
 use object_store::{ObjectStore, path::Path as StorePath};
 use protocol::api::{
     ArtifactResponse, ArtifactUploadCreateRequest, ArtifactUploadSessionResponse, HeartbeatRequest,
-    LiveLogChunkRequest, PollRequest, PollResponse, PutRateLimitRequest, PutSecretRequest,
-    RegisterExecutorRequest, TaskResponse, TaskStatusUpdateRequest, TaskSubmitRequest,
+    LiveLogChunkRequest, PayloadResponse, PayloadUploadCreateRequest, PayloadUploadSessionResponse,
+    PollRequest, PollResponse, PutRateLimitRequest, PutSecretRequest, RegisterExecutorRequest,
+    TaskResponse, TaskStatusUpdateRequest, TaskSubmitRequest,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -48,6 +49,7 @@ pub async fn health() -> impl IntoResponse {
 pub struct AppState {
     pub task_repo: Arc<dyn TaskRepository>,
     pub artifact_repo: Arc<dyn ArtifactRepository>,
+    pub payload_repo: Arc<dyn PayloadRepository>,
     pub executor_repo: Arc<dyn ExecutorRepository>,
     pub rate_limit_repo: Arc<dyn RateLimitRepository>,
     pub secret_repo: Arc<dyn SecretRepository>,
@@ -90,6 +92,14 @@ pub async fn submit_task(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<TaskSubmitRequest>,
 ) -> impl IntoResponse {
+    if payload.payload.is_some() && payload.payload_upload_id.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "provide either inline payload or payload_upload_id" })),
+        )
+            .into_response();
+    }
+
     let artifact = match state.artifact_repo.get_artifact(payload.artifact_id).await {
         Ok(Some(artifact)) => artifact,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -123,9 +133,9 @@ pub async fn submit_task(
             .into_response();
     }
 
-    let task_id = Uuid::new_v4();
-    let (payload_ref, payload_size_bytes) = match payload.payload {
+    let (task_id, payload_ref, payload_size_bytes) = match payload.payload {
         Some(payload_json) => {
+            let task_id = Uuid::new_v4();
             let bytes = match serde_json::to_vec(&payload_json) {
                 Ok(bytes) => bytes,
                 Err(err) => {
@@ -138,9 +148,45 @@ pub async fn submit_task(
                 tracing::error!("Failed to upload task payload: {}", err);
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
-            (Some(key), Some(bytes.len() as i64))
+            (task_id, Some(key), Some(bytes.len() as i64))
         }
-        None => (None, None),
+        None => match payload.payload_upload_id {
+            Some(payload_upload_id) => {
+                let payload_object = match state.payload_repo.get_payload(payload_upload_id).await {
+                    Ok(Some(payload_object)) => payload_object,
+                    Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+                    Err(err) => {
+                        tracing::error!("Failed to load payload during task submission: {:?}", err);
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                };
+
+                if payload_object.tenant_id != payload.tenant_id {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({ "error": "payload does not belong to tenant" })),
+                    )
+                        .into_response();
+                }
+
+                if payload_object.status != domain::PayloadStatus::Ready
+                    || payload_object.object_key.is_none()
+                {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({ "error": "payload is not ready for execution" })),
+                    )
+                        .into_response();
+                }
+
+                (
+                    Uuid::new_v4(),
+                    payload_object.object_key,
+                    Some(payload_object.size_bytes),
+                )
+            }
+            None => (Uuid::new_v4(), None, None),
+        },
     };
     let task = domain::Task {
         id: task_id,
@@ -402,6 +448,123 @@ pub async fn get_artifact(
     }
 }
 
+pub async fn create_payload_upload(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<PayloadUploadCreateRequest>,
+) -> impl IntoResponse {
+    let payload_object = domain::PayloadObject {
+        id: Uuid::new_v4(),
+        tenant_id: payload.tenant_id,
+        digest: payload.digest,
+        size_bytes: payload.size_bytes,
+        status: domain::PayloadStatus::PendingUpload,
+        object_key: None,
+    };
+
+    match state
+        .payload_repo
+        .create_payload_upload(&payload_object)
+        .await
+    {
+        Ok(upload_session) => (
+            StatusCode::CREATED,
+            Json(PayloadUploadSessionResponse {
+                payload: payload_object,
+                upload_session,
+            }),
+        )
+            .into_response(),
+        Err(RepositoryError::Conflict(msg)) => {
+            (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
+        }
+        Err(err) => {
+            tracing::error!("Database error during payload upload creation: {:?}", err);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn upload_payload_content(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    body: Body,
+) -> impl IntoResponse {
+    let session = match state.payload_repo.get_upload_session(id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!(
+                "Database error during payload upload session lookup: {:?}",
+                err
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let payload_object = match state.payload_repo.get_payload(session.payload_id).await {
+        Ok(Some(payload_object)) => payload_object,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!("Database error during payload upload lookup: {:?}", err);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let bytes: Bytes = match to_bytes(body, payload_object.size_bytes.max(0) as usize + 1).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!("Payload upload body rejected: {}", err);
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+
+    if bytes.len() as i64 != payload_object.size_bytes {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    if serde_json::from_slice::<Value>(&bytes).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "payload must be valid JSON" })),
+        )
+            .into_response();
+    }
+
+    let actual_digest = format!("sha256:{:x}", Sha256::digest(bytes.as_ref()));
+    if !digest_matches(&payload_object.digest, &actual_digest) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "payload digest verification failed" })),
+        )
+            .into_response();
+    }
+
+    let key = format!("payloads/{}.json", payload_object.id);
+    match storage::put_bytes(&state.output_store, &key, bytes.to_vec()).await {
+        Ok(()) => match state.payload_repo.complete_payload_upload(id, &key).await {
+            Ok(payload_object) => (
+                StatusCode::OK,
+                Json(PayloadResponse {
+                    payload: payload_object,
+                }),
+            )
+                .into_response(),
+            Err(RepositoryError::Conflict(msg)) => {
+                (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
+            }
+            Err(RepositoryError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+            Err(err) => {
+                tracing::error!("Failed to finalize payload upload: {:?}", err);
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        },
+        Err(err) => {
+            tracing::error!("Failed to upload payload content: {}", err);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 pub async fn upload_artifact_content(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -438,7 +601,7 @@ pub async fn upload_artifact_content(
     }
 
     let actual_digest = format!("sha256:{:x}", Sha256::digest(bytes.as_ref()));
-    if !artifact_digest_matches(&artifact.digest, &actual_digest) {
+    if !digest_matches(&artifact.digest, &actual_digest) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "artifact digest verification failed" })),
@@ -466,7 +629,7 @@ pub async fn upload_artifact_content(
     }
 }
 
-fn artifact_digest_matches(expected: &str, actual: &str) -> bool {
+fn digest_matches(expected: &str, actual: &str) -> bool {
     expected == actual || expected == actual.trim_start_matches("sha256:")
 }
 
