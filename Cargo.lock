@@ -308,6 +308,7 @@ dependencies = [
  "dotenvy",
  "http-body-util",
  "hyper",
+ "object_store",
  "persistence",
  "protocol",
  "serde",
@@ -315,6 +316,7 @@ dependencies = [
  "sqlx",
  "telemetry",
  "tokio",
+ "tokio-stream",
  "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
@@ -1652,6 +1654,7 @@ version = "0.1.0"
 dependencies = [
  "domain",
  "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -2670,6 +2673,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
