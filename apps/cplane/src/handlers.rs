@@ -1,21 +1,34 @@
 use application::ports::repositories::{
-    ExecutorRepository, RateLimitRepository, RepositoryError, SecretRepository, TaskRepository,
+    ArtifactRepository, ExecutorRepository, RateLimitRepository, RepositoryError, SecretRepository,
+    TaskRepository,
 };
 use axum::{
     Json,
+    body::Body,
     extract::{Path, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    http::header::{CONTENT_TYPE, HeaderValue},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
+use object_store::{ObjectStore, path::Path as StorePath};
 use protocol::api::{
-    HeartbeatRequest, PollRequest, PollResponse, PutRateLimitRequest, PutSecretRequest,
-    RegisterExecutorRequest, TaskResponse, TaskStatusUpdateRequest, TaskSubmitRequest,
+    ArtifactRegisterRequest, ArtifactResponse, HeartbeatRequest, LiveLogChunkRequest, PollRequest,
+    PollResponse, PutRateLimitRequest, PutSecretRequest, RegisterExecutorRequest, TaskResponse,
+    TaskStatusUpdateRequest, TaskSubmitRequest,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
+
+use crate::{live_logs::LiveLogHub, storage};
 
 pub async fn health() -> impl IntoResponse {
     let uptime = SystemTime::now()
@@ -33,9 +46,12 @@ pub async fn health() -> impl IntoResponse {
 
 pub struct AppState {
     pub task_repo: Arc<dyn TaskRepository>,
+    pub artifact_repo: Arc<dyn ArtifactRepository>,
     pub executor_repo: Arc<dyn ExecutorRepository>,
     pub rate_limit_repo: Arc<dyn RateLimitRepository>,
     pub secret_repo: Arc<dyn SecretRepository>,
+    pub output_store: Arc<dyn ObjectStore>,
+    pub log_hub: Arc<LiveLogHub>,
 }
 
 pub enum ApiError {
@@ -73,6 +89,24 @@ pub async fn submit_task(
     Json(payload): Json<TaskSubmitRequest>,
 ) -> impl IntoResponse {
     let task_id = Uuid::new_v4();
+    let (payload_ref, payload_size_bytes) = match payload.payload {
+        Some(payload_json) => {
+            let bytes = match serde_json::to_vec(&payload_json) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::error!("Failed to serialize task payload: {}", err);
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+            };
+            let key = format!("tasks/{task_id}/payload.json");
+            if let Err(err) = storage::put_bytes(&state.output_store, &key, bytes.clone()).await {
+                tracing::error!("Failed to upload task payload: {}", err);
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            (Some(key), Some(bytes.len() as i64))
+        }
+        None => (None, None),
+    };
     let task = domain::Task {
         id: task_id,
         tenant_id: payload.tenant_id,
@@ -81,10 +115,12 @@ pub async fn submit_task(
         status: domain::TaskStatus::Queued,
         priority: payload.priority.unwrap_or(0),
         rate_limit_key: payload.rate_limit_key,
+        payload_ref,
         timeout_seconds: payload.timeout_seconds.unwrap_or(300),
         max_attempts: payload.max_attempts.unwrap_or(3),
         current_attempt: 0,
         idempotency_key: payload.idempotency_key,
+        payload_size_bytes,
     };
 
     match state.task_repo.insert_task(&task).await {
@@ -126,6 +162,46 @@ pub async fn get_task(
     }
 }
 
+pub async fn get_task_logs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    fetch_task_blob(state, id, BlobKind::Logs).await
+}
+
+pub async fn stream_task_logs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let receiver = state.log_hub.subscribe(id).await;
+    let stream = BroadcastStream::new(receiver).filter_map(|message| {
+        match message {
+            Ok(chunk) => Some(Ok(Event::default().data(chunk))),
+            Err(_) => None,
+        }
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(5)))
+}
+
+pub async fn append_task_log(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<LiveLogChunkRequest>,
+) -> impl IntoResponse {
+    let chunk = format!("[{}] {}", payload.stream, payload.chunk);
+    state.log_hub.publish(id, chunk).await;
+    let _ = (payload.lease_id, payload.executor_id);
+    StatusCode::NO_CONTENT
+}
+
+pub async fn get_task_result(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    fetch_task_blob(state, id, BlobKind::Result).await
+}
+
 pub async fn poll_tasks(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<PollRequest>,
@@ -140,6 +216,14 @@ pub async fn poll_tasks(
         .await
     {
         Ok(Some((task, lease))) => {
+            let payload =
+                match load_task_payload(&state.output_store, task.payload_ref.as_deref()).await {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        tracing::error!("Failed to load task payload during poll: {}", err);
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                };
             let environment = match state.secret_repo.get_tenant_secrets(task.tenant_id).await {
                 Ok(environment) => environment,
                 Err(err) => {
@@ -151,6 +235,7 @@ pub async fn poll_tasks(
                 task: Some(task),
                 lease: Some(lease),
                 environment,
+                payload,
             };
             (StatusCode::OK, Json(response)).into_response()
         }
@@ -159,6 +244,7 @@ pub async fn poll_tasks(
                 task: None,
                 lease: None,
                 environment: BTreeMap::new(),
+                payload: None,
             };
             (StatusCode::OK, Json(response)).into_response()
         }
@@ -192,6 +278,45 @@ pub async fn register_executor(
     }
 }
 
+pub async fn register_artifact(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ArtifactRegisterRequest>,
+) -> impl IntoResponse {
+    let artifact = domain::Artifact {
+        id: Uuid::new_v4(),
+        tenant_id: payload.tenant_id,
+        digest: payload.digest,
+        runtime_pack_id: payload.runtime_pack_id,
+        entrypoint: payload.entrypoint,
+        size_bytes: payload.size_bytes,
+    };
+
+    match state.artifact_repo.insert_artifact(&artifact).await {
+        Ok(_) => (StatusCode::CREATED, Json(ArtifactResponse { artifact })).into_response(),
+        Err(RepositoryError::Conflict(msg)) => {
+            (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
+        }
+        Err(err) => {
+            tracing::error!("Database error during artifact registration: {:?}", err);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn get_artifact(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    match state.artifact_repo.get_artifact(id).await {
+        Ok(Some(artifact)) => (StatusCode::OK, Json(ArtifactResponse { artifact })).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!("Database error during artifact lookup: {:?}", err);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 pub async fn heartbeat_executor(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<HeartbeatRequest>,
@@ -220,6 +345,7 @@ pub async fn update_task_status(
         "Succeeded" => domain::TaskStatus::Succeeded,
         "Failed" => domain::TaskStatus::Failed,
         "Cancelled" => domain::TaskStatus::Cancelled,
+        "TimedOut" => domain::TaskStatus::TimedOut,
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
 
@@ -295,4 +421,77 @@ pub async fn put_secret(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+enum BlobKind {
+    Logs,
+    Result,
+}
+
+async fn fetch_task_blob(state: Arc<AppState>, id: Uuid, kind: BlobKind) -> Response {
+    let outputs = match state.task_repo.get_task_outputs(id).await {
+        Ok(Some(outputs)) => outputs,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!("Failed to load task outputs: {:?}", err);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let object_key = match kind {
+        BlobKind::Logs => outputs.logs_ref,
+        BlobKind::Result => outputs.result_ref,
+    };
+
+    let object_key = match object_key {
+        Some(key) => key,
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let bytes = match state
+        .output_store
+        .get(&StorePath::from(object_key.as_str()))
+        .await
+    {
+        Ok(result) => match result.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::error!("Failed reading task output body: {}", err);
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        },
+        Err(object_store::Error::NotFound { .. }) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!("Failed fetching task output object: {}", err);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let content_type = match kind {
+        BlobKind::Logs => HeaderValue::from_static("text/plain; charset=utf-8"),
+        BlobKind::Result => HeaderValue::from_static("application/json"),
+    };
+
+    let mut response = Response::new(Body::from(bytes.to_vec()));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(CONTENT_TYPE, content_type);
+    response
+}
+
+async fn load_task_payload(
+    store: &Arc<dyn ObjectStore>,
+    payload_ref: Option<&str>,
+) -> Result<Option<Value>, String> {
+    let Some(payload_ref) = payload_ref else {
+        return Ok(None);
+    };
+
+    let result = store
+        .get(&StorePath::from(payload_ref))
+        .await
+        .map_err(|err| err.to_string())?;
+    let bytes = result.bytes().await.map_err(|err| err.to_string())?;
+    let payload = serde_json::from_slice::<Value>(&bytes).map_err(|err| err.to_string())?;
+
+    Ok(Some(payload))
 }
