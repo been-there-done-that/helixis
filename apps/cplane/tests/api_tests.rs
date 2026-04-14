@@ -17,10 +17,11 @@ use persistence::{
     },
 };
 use protocol::api::{
-    ArtifactRegisterRequest, ArtifactResponse, HeartbeatRequest, LiveLogChunkRequest, PollRequest,
-    PollResponse, PutRateLimitRequest, PutSecretRequest, RegisterExecutorRequest, TaskResponse,
-    TaskStatusUpdateRequest, TaskSubmitRequest,
+    ArtifactResponse, ArtifactUploadCreateRequest, ArtifactUploadSessionResponse, HeartbeatRequest,
+    LiveLogChunkRequest, PollRequest, PollResponse, PutRateLimitRequest, PutSecretRequest,
+    RegisterExecutorRequest, TaskResponse, TaskStatusUpdateRequest, TaskSubmitRequest,
 };
+use sha2::{Digest, Sha256};
 use std::env;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -79,20 +80,35 @@ fn build_state(pool: &sqlx::PgPool) -> Arc<AppState> {
     })
 }
 
+async fn insert_ready_artifact(pool: &sqlx::PgPool, tenant_id: Uuid, runtime_pack: &str) -> Uuid {
+    let artifact_id = Uuid::new_v4();
+    let object_key = format!("artifacts/{artifact_id}");
+
+    sqlx::query(
+        r#"
+        INSERT INTO artifacts (
+            id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes, status, object_key
+        ) VALUES ($1, $2, $3, $4, 'main.py', 100, 'Ready', $5)
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(tenant_id)
+    .bind(Uuid::new_v4().to_string())
+    .bind(runtime_pack)
+    .bind(object_key)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    artifact_id
+}
+
 #[tokio::test]
 async fn test_full_api_flow() {
     let pool = setup_db().await;
     let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
 
-    // We need an artifact
-    let artifact_id = Uuid::new_v4();
-    sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
-        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
 
     let state = build_state(&pool);
     let executor_repo = Arc::new(PostgresExecutorRepository::new(pool.clone()));
@@ -236,14 +252,7 @@ async fn test_reject_mismatched_artifact_runtime() {
     .await
     .unwrap();
 
-    let artifact_id = Uuid::new_v4();
-    sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
-        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
 
     let app = app_router(build_state(&pool));
 
@@ -323,14 +332,7 @@ async fn test_cancel_endpoint_marks_task_cancelled() {
     let pool = setup_db().await;
     let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
 
-    let artifact_id = Uuid::new_v4();
-    sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
-        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
 
     let app = app_router(build_state(&pool));
 
@@ -396,15 +398,7 @@ async fn test_cancel_endpoint_marks_task_cancelled() {
 async fn test_poll_includes_tenant_secrets() {
     let pool = setup_db().await;
     let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
-    let artifact_id = Uuid::new_v4();
-
-    sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
-        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
 
     let app = app_router(build_state(&pool));
     let executor_id = Uuid::new_v4();
@@ -506,15 +500,7 @@ async fn test_poll_includes_tenant_secrets() {
 async fn test_rate_limit_blocks_second_inflight_task() {
     let pool = setup_db().await;
     let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
-    let artifact_id = Uuid::new_v4();
-
-    sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
-        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
 
     let app = app_router(build_state(&pool));
     let executor_id = Uuid::new_v4();
@@ -633,7 +619,7 @@ async fn test_register_and_get_artifact() {
     let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
     let app = app_router(build_state(&pool));
 
-    let request = ArtifactRegisterRequest {
+    let request = ArtifactUploadCreateRequest {
         tenant_id,
         digest: format!("sha256:{}", Uuid::new_v4()),
         runtime_pack_id: runtime_pack,
@@ -646,7 +632,7 @@ async fn test_register_and_get_artifact() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/artifacts")
+                .uri("/v1/artifact-uploads")
                 .header("Content-Type", "application/json")
                 .body(Body::from(serde_json::to_string(&request).unwrap()))
                 .unwrap(),
@@ -656,7 +642,11 @@ async fn test_register_and_get_artifact() {
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let artifact_response: ArtifactResponse = serde_json::from_slice(&body).unwrap();
+    let artifact_response: ArtifactUploadSessionResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        artifact_response.artifact.status,
+        domain::ArtifactStatus::PendingUpload
+    );
 
     let response = app
         .oneshot(
@@ -691,9 +681,10 @@ async fn test_upload_artifact_content_stores_blob() {
     });
     let app = app_router(state);
 
-    let register = ArtifactRegisterRequest {
+    let artifact_bytes = b"test".to_vec();
+    let register = ArtifactUploadCreateRequest {
         tenant_id,
-        digest: format!("sha256:{}", Uuid::new_v4()),
+        digest: format!("sha256:{:x}", Sha256::digest(&artifact_bytes)),
         runtime_pack_id: runtime_pack,
         entrypoint: "main.py".to_string(),
         size_bytes: 4,
@@ -704,7 +695,7 @@ async fn test_upload_artifact_content_stores_blob() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/artifacts")
+                .uri("/v1/artifact-uploads")
                 .header("Content-Type", "application/json")
                 .body(Body::from(serde_json::to_string(&register).unwrap()))
                 .unwrap(),
@@ -713,33 +704,97 @@ async fn test_upload_artifact_content_stores_blob() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let artifact_response: ArtifactResponse = serde_json::from_slice(&body).unwrap();
+    let upload_response: ArtifactUploadSessionResponse = serde_json::from_slice(&body).unwrap();
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri(format!(
-                    "/v1/artifacts/{}/content",
-                    artifact_response.artifact.id
+                    "/v1/artifact-uploads/{}/content",
+                    upload_response.upload_session.id
                 ))
-                .body(Body::from("test"))
+                .body(Body::from(artifact_bytes.clone()))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let artifact_response: ArtifactResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        artifact_response.artifact.status,
+        domain::ArtifactStatus::Ready
+    );
 
     let bytes = artifact_store
-        .get(&object_store::path::Path::from(
-            artifact_response.artifact.id.to_string(),
-        ))
+        .get(&object_store::path::Path::from(format!(
+            "artifacts/{}",
+            artifact_response.artifact.id
+        )))
         .await
         .unwrap()
         .bytes()
         .await
         .unwrap();
     assert_eq!(&bytes[..], b"test");
+}
+
+#[tokio::test]
+async fn test_reject_task_submission_for_pending_artifact() {
+    let pool = setup_db().await;
+    let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
+    let app = app_router(build_state(&pool));
+
+    let request = ArtifactUploadCreateRequest {
+        tenant_id,
+        digest: format!("sha256:{}", Uuid::new_v4()),
+        runtime_pack_id: runtime_pack.clone(),
+        entrypoint: "main.py".to_string(),
+        size_bytes: 512,
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/artifact-uploads")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let upload_response: ArtifactUploadSessionResponse = serde_json::from_slice(&body).unwrap();
+
+    let submit_req = TaskSubmitRequest {
+        tenant_id,
+        artifact_id: upload_response.artifact.id,
+        runtime_pack_id: runtime_pack,
+        payload: None,
+        priority: None,
+        rate_limit_key: None,
+        timeout_seconds: None,
+        max_attempts: None,
+        idempotency_key: None,
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&submit_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -762,14 +817,7 @@ async fn test_task_output_retrieval_endpoints() {
     });
     let app = app_router(state);
 
-    let artifact_id = Uuid::new_v4();
-    sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
-        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
 
     let executor_repo = Arc::new(PostgresExecutorRepository::new(pool.clone()));
     let executor = Executor {
@@ -856,15 +904,7 @@ async fn test_task_output_retrieval_endpoints() {
 async fn test_poll_includes_offloaded_payload() {
     let pool = setup_db().await;
     let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
-    let artifact_id = Uuid::new_v4();
-
-    sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
-        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
 
     let app = app_router(build_state(&pool));
     let executor_id = Uuid::new_v4();
@@ -944,15 +984,8 @@ async fn test_poll_includes_offloaded_payload() {
 async fn test_append_live_log_publishes_to_hub() {
     let pool = setup_db().await;
     let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
-    let artifact_id = Uuid::new_v4();
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
     let task_id = Uuid::new_v4();
-    sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
-        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
 
     let state = build_state(&pool);
     let mut receiver = state.log_hub.subscribe(task_id).await;
@@ -1019,14 +1052,7 @@ async fn test_append_live_log_publishes_to_hub() {
 async fn test_get_logs_replays_persisted_chunks() {
     let pool = setup_db().await;
     let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
-    let artifact_id = Uuid::new_v4();
-    sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
-        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
 
     let state = build_state(&pool);
     let app = app_router(Arc::clone(&state));

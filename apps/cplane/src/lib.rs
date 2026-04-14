@@ -20,10 +20,13 @@ pub fn app_router(state: Arc<AppState>) -> Router {
         .route("/v1/tasks/:id/result", get(handlers::get_task_result))
         .route("/v1/tasks/:id/cancel", post(handlers::cancel_task))
         .route("/v1/tasks/:id/status", post(handlers::update_task_status))
-        .route("/v1/artifacts", post(handlers::register_artifact))
+        .route(
+            "/v1/artifact-uploads",
+            post(handlers::create_artifact_upload),
+        )
         .route("/v1/artifacts/:id", get(handlers::get_artifact))
         .route(
-            "/v1/artifacts/:id/content",
+            "/v1/artifact-uploads/:id/content",
             post(handlers::upload_artifact_content),
         )
         .route("/v1/secrets", post(handlers::put_secret))

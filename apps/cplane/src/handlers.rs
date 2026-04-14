@@ -15,11 +15,12 @@ use axum::{
 };
 use object_store::{ObjectStore, path::Path as StorePath};
 use protocol::api::{
-    ArtifactRegisterRequest, ArtifactResponse, HeartbeatRequest, LiveLogChunkRequest, PollRequest,
-    PollResponse, PutRateLimitRequest, PutSecretRequest, RegisterExecutorRequest, TaskResponse,
-    TaskStatusUpdateRequest, TaskSubmitRequest,
+    ArtifactResponse, ArtifactUploadCreateRequest, ArtifactUploadSessionResponse, HeartbeatRequest,
+    LiveLogChunkRequest, PollRequest, PollResponse, PutRateLimitRequest, PutSecretRequest,
+    RegisterExecutorRequest, TaskResponse, TaskStatusUpdateRequest, TaskSubmitRequest,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -89,6 +90,39 @@ pub async fn submit_task(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<TaskSubmitRequest>,
 ) -> impl IntoResponse {
+    let artifact = match state.artifact_repo.get_artifact(payload.artifact_id).await {
+        Ok(Some(artifact)) => artifact,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!("Failed to load artifact during task submission: {:?}", err);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    if artifact.tenant_id != payload.tenant_id {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "artifact does not belong to tenant" })),
+        )
+            .into_response();
+    }
+
+    if artifact.runtime_pack_id != payload.runtime_pack_id {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "artifact runtime does not match task runtime pack" })),
+        )
+            .into_response();
+    }
+
+    if artifact.status != domain::ArtifactStatus::Ready || artifact.object_key.is_none() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "artifact is not ready for execution" })),
+        )
+            .into_response();
+    }
+
     let task_id = Uuid::new_v4();
     let (payload_ref, payload_size_bytes) = match payload.payload {
         Some(payload_json) => {
@@ -320,9 +354,9 @@ pub async fn register_executor(
     }
 }
 
-pub async fn register_artifact(
+pub async fn create_artifact_upload(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<ArtifactRegisterRequest>,
+    Json(payload): Json<ArtifactUploadCreateRequest>,
 ) -> impl IntoResponse {
     let artifact = domain::Artifact {
         id: Uuid::new_v4(),
@@ -331,10 +365,19 @@ pub async fn register_artifact(
         runtime_pack_id: payload.runtime_pack_id,
         entrypoint: payload.entrypoint,
         size_bytes: payload.size_bytes,
+        status: domain::ArtifactStatus::PendingUpload,
+        object_key: None,
     };
 
-    match state.artifact_repo.insert_artifact(&artifact).await {
-        Ok(_) => (StatusCode::CREATED, Json(ArtifactResponse { artifact })).into_response(),
+    match state.artifact_repo.create_artifact_upload(&artifact).await {
+        Ok(upload_session) => (
+            StatusCode::CREATED,
+            Json(ArtifactUploadSessionResponse {
+                artifact,
+                upload_session,
+            }),
+        )
+            .into_response(),
         Err(RepositoryError::Conflict(msg)) => {
             (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
         }
@@ -364,7 +407,16 @@ pub async fn upload_artifact_content(
     Path(id): Path<Uuid>,
     body: Body,
 ) -> impl IntoResponse {
-    let artifact = match state.artifact_repo.get_artifact(id).await {
+    let session = match state.artifact_repo.get_upload_session(id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!("Database error during upload session lookup: {:?}", err);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let artifact = match state.artifact_repo.get_artifact(session.artifact_id).await {
         Ok(Some(artifact)) => artifact,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(err) => {
@@ -385,14 +437,37 @@ pub async fn upload_artifact_content(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let key = artifact.id.to_string();
+    let actual_digest = format!("sha256:{:x}", Sha256::digest(bytes.as_ref()));
+    if !artifact_digest_matches(&artifact.digest, &actual_digest) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "artifact digest verification failed" })),
+        )
+            .into_response();
+    }
+
+    let key = format!("artifacts/{}", artifact.id);
     match storage::put_bytes(&state.artifact_store, &key, bytes.to_vec()).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => match state.artifact_repo.complete_artifact_upload(id, &key).await {
+            Ok(artifact) => (StatusCode::OK, Json(ArtifactResponse { artifact })).into_response(),
+            Err(RepositoryError::Conflict(msg)) => {
+                (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
+            }
+            Err(RepositoryError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+            Err(err) => {
+                tracing::error!("Failed to finalize artifact upload: {:?}", err);
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        },
         Err(err) => {
             tracing::error!("Failed to upload artifact content: {}", err);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+fn artifact_digest_matches(expected: &str, actual: &str) -> bool {
+    expected == actual || expected == actual.trim_start_matches("sha256:")
 }
 
 pub async fn heartbeat_executor(
