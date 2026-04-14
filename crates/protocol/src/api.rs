@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use domain::{Task, TaskLease};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -31,6 +33,7 @@ pub struct PollRequest {
 pub struct PollResponse {
     pub task: Option<Task>,
     pub lease: Option<TaskLease>,
+    pub environment: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,4 +56,18 @@ pub struct TaskStatusUpdateRequest {
     pub logs_ref: Option<String>,
     pub result_ref: Option<String>,
     pub last_error_message: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PutRateLimitRequest {
+    pub tenant_id: Uuid,
+    pub key: String,
+    pub max_inflight: i32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PutSecretRequest {
+    pub tenant_id: Uuid,
+    pub key: String,
+    pub value: String,
 }

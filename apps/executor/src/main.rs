@@ -33,8 +33,12 @@ async fn main() {
 
     let command = std::env::var("EXECUTOR_COMMAND").unwrap_or_else(|_| "python3".to_string());
     let entrypoint = std::env::var("EXECUTOR_ENTRYPOINT").unwrap_or_else(|_| "main.py".to_string());
-    let sandbox = ProcessSandbox { downloader, command, entrypoint };
-    
+    let sandbox = ProcessSandbox {
+        downloader,
+        command,
+        entrypoint,
+    };
+
     let env_pack_id =
         std::env::var("RUNTIME_PACK_ID").unwrap_or_else(|_| "demo-python-pack".to_string());
     let runtime_pack_id = env_pack_id.clone();
@@ -65,7 +69,7 @@ async fn main() {
         tracing::debug!("Polling queue...");
 
         match client.poll_task(&runtime_pack_id, 120).await {
-            Ok(Some((task, lease))) => {
+            Ok(Some((task, lease, environment))) => {
                 consecutive_empty_polls = 0;
                 tracing::info!("Acquired task {}! Executing now...", task.id);
 
@@ -79,7 +83,10 @@ async fn main() {
                 }
 
                 // Execute mock task
-                match sandbox.execute(&task, &lease, Arc::clone(&client)).await {
+                match sandbox
+                    .execute(&task, &lease, Arc::clone(&client), environment)
+                    .await
+                {
                     Ok(outcome) => {
                         let status_name = format!("{:?}", outcome.status);
                         tracing::info!(
@@ -101,16 +108,12 @@ async fn main() {
                         }
                     }
                     Err(e) => {
-                        tracing::error!("Execution infrastructure failed: {}. Reporting failure...", e);
+                        tracing::error!(
+                            "Execution infrastructure failed: {}. Reporting failure...",
+                            e
+                        );
                         if let Err(err) = client
-                            .report_status(
-                                task.id,
-                                lease.id,
-                                "Failed",
-                                None,
-                                None,
-                                Some(e),
-                            )
+                            .report_status(task.id, lease.id, "Failed", None, None, Some(e))
                             .await
                         {
                             tracing::error!("Failed to report Failed status: {}", err);

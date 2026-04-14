@@ -2,8 +2,10 @@ use application::ports::repositories::TaskRepository;
 use cplane::app_router;
 use cplane::handlers::AppState;
 use persistence::db;
-use persistence::repositories::executor_repo::PostgresExecutorRepository;
-use persistence::repositories::task_repo::PostgresTaskRepository;
+use persistence::repositories::executor::PostgresExecutorRepository;
+use persistence::repositories::rate_limit::PostgresRateLimitRepository;
+use persistence::repositories::secret::PostgresSecretRepository;
+use persistence::repositories::task::PostgresTaskRepository;
 use std::env;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -22,7 +24,11 @@ async fn main() {
         .expect("Failed to create postgres pool");
 
     let task_repo = Arc::new(PostgresTaskRepository::new(pool.clone()));
-    let executor_repo = Arc::new(PostgresExecutorRepository::new(pool));
+    let executor_repo = Arc::new(PostgresExecutorRepository::new(pool.clone()));
+    let rate_limit_repo = Arc::new(PostgresRateLimitRepository::new(pool.clone()));
+    let secret_key = env::var("HELIXIS_SECRETS_KEY")
+        .unwrap_or_else(|_| "dev-only-insecure-key-change-me".to_string());
+    let secret_repo = Arc::new(PostgresSecretRepository::new(pool, &secret_key));
 
     let reconciler_repo = Arc::clone(&task_repo);
     tokio::spawn(async move {
@@ -40,6 +46,8 @@ async fn main() {
     let state = Arc::new(AppState {
         task_repo,
         executor_repo,
+        rate_limit_repo,
+        secret_repo,
     });
     let app = app_router(state);
 

@@ -1,6 +1,7 @@
 use crate::artifact_client::ArtifactDownloader;
 use crate::client::CplaneClient;
 use domain::{Task, TaskLease, TaskStatus};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ pub trait TaskSandbox {
         task: &Task,
         lease: &TaskLease,
         client: Arc<CplaneClient>,
+        environment: BTreeMap<String, String>,
     ) -> Result<ExecutionOutcome, String>;
 }
 
@@ -38,6 +40,7 @@ impl TaskSandbox for ProcessSandbox {
         task: &Task,
         lease: &TaskLease,
         client: Arc<CplaneClient>,
+        environment: BTreeMap<String, String>,
     ) -> Result<ExecutionOutcome, String> {
         tracing::info!(
             "ProcessSandbox: Checking S3 artifact cache for [{}]...",
@@ -82,6 +85,7 @@ impl TaskSandbox for ProcessSandbox {
             .arg(entrypoint)
             .current_dir(&run_dir)
             .env("TASK_WORKSPACE", &run_dir)
+            .envs(environment)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -185,7 +189,9 @@ async fn build_outcome(
     let last_error_message = match status {
         TaskStatus::Failed => Some(format!(
             "Process exited with code {}{}",
-            exit_code.map(|code| code.to_string()).unwrap_or_else(|| "unknown".to_string()),
+            exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
             if stderr.trim().is_empty() {
                 String::new()
             } else {

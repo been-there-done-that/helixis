@@ -1,8 +1,13 @@
-use application::ports::repositories::{ExecutorRepository, TaskRepository};
+use application::ports::repositories::{
+    ExecutorRepository, RateLimitRepository, SecretRepository, TaskRepository,
+};
 use domain::{Executor, Task, TaskStatus};
 use persistence::{
     db,
-    repositories::{executor_repo::PostgresExecutorRepository, task_repo::PostgresTaskRepository},
+    repositories::{
+        executor::PostgresExecutorRepository, rate_limit::PostgresRateLimitRepository,
+        secret::PostgresSecretRepository, task::PostgresTaskRepository,
+    },
 };
 use sqlx::PgPool;
 use std::env;
@@ -247,5 +252,75 @@ async fn test_stale_executor_cannot_poll() {
         .await
         .unwrap_err();
 
-    assert!(matches!(err, application::ports::repositories::RepositoryError::Conflict(_)));
+    assert!(matches!(
+        err,
+        application::ports::repositories::RepositoryError::Conflict(_)
+    ));
+}
+
+#[tokio::test]
+async fn test_rate_limit_prevents_second_lease() {
+    let pool = setup_db().await;
+    let task_repo = PostgresTaskRepository::new(pool.clone());
+    let executor_repo = PostgresExecutorRepository::new(pool.clone());
+    let rate_limit_repo = PostgresRateLimitRepository::new(pool.clone());
+
+    let (tenant_id, artifact_id, runtime_pack_id) = insert_prereqs(&pool).await;
+
+    rate_limit_repo
+        .put_rate_limit(tenant_id, "customer-123", 1)
+        .await
+        .unwrap();
+
+    let executor = Executor {
+        id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+        capabilities: vec![runtime_pack_id.clone()],
+    };
+    executor_repo.upsert_executor(&executor).await.unwrap();
+
+    for _ in 0..2 {
+        let task = Task {
+            id: Uuid::new_v4(),
+            tenant_id,
+            artifact_id,
+            runtime_pack_id: runtime_pack_id.clone(),
+            status: TaskStatus::Queued,
+            priority: 1,
+            rate_limit_key: Some("customer-123".to_string()),
+            timeout_seconds: 60,
+            max_attempts: 3,
+            current_attempt: 0,
+            idempotency_key: None,
+        };
+
+        task_repo.insert_task(&task).await.unwrap();
+    }
+
+    let first = task_repo
+        .poll_and_lease(&runtime_pack_id, executor.id, 60)
+        .await
+        .unwrap();
+    assert!(first.is_some());
+
+    let second = task_repo
+        .poll_and_lease(&runtime_pack_id, executor.id, 60)
+        .await
+        .unwrap();
+    assert!(second.is_none());
+}
+
+#[tokio::test]
+async fn test_secret_round_trip() {
+    let pool = setup_db().await;
+    let (tenant_id, _, _) = insert_prereqs(&pool).await;
+    let secret_repo = PostgresSecretRepository::new(pool.clone(), "test-secret-key");
+
+    secret_repo
+        .put_secret(tenant_id, "API_TOKEN", "top-secret")
+        .await
+        .unwrap();
+
+    let secrets = secret_repo.get_tenant_secrets(tenant_id).await.unwrap();
+    assert_eq!(secrets.get("API_TOKEN"), Some(&"top-secret".to_string()));
 }

@@ -1,4 +1,6 @@
-use application::ports::repositories::{ExecutorRepository, RepositoryError, TaskRepository};
+use application::ports::repositories::{
+    ExecutorRepository, RateLimitRepository, RepositoryError, SecretRepository, TaskRepository,
+};
 use axum::{
     Json,
     extract::{Path, State},
@@ -6,16 +8,19 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use protocol::api::{
-    HeartbeatRequest, PollRequest, PollResponse, RegisterExecutorRequest, TaskResponse,
-    TaskStatusUpdateRequest, TaskSubmitRequest,
+    HeartbeatRequest, PollRequest, PollResponse, PutRateLimitRequest, PutSecretRequest,
+    RegisterExecutorRequest, TaskResponse, TaskStatusUpdateRequest, TaskSubmitRequest,
 };
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
 pub struct AppState {
     pub task_repo: Arc<dyn TaskRepository>,
     pub executor_repo: Arc<dyn ExecutorRepository>,
+    pub rate_limit_repo: Arc<dyn RateLimitRepository>,
+    pub secret_repo: Arc<dyn SecretRepository>,
 }
 
 pub enum ApiError {
@@ -77,11 +82,7 @@ pub async fn submit_task(
         }
         Err(RepositoryError::Conflict(msg)) => {
             tracing::warn!("Task submission rejected: {}", msg);
-            (
-                StatusCode::CONFLICT,
-                Json(json!({ "error": msg })),
-            )
-                .into_response()
+            (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
         }
         Err(e) => {
             tracing::error!("Database error: {:?}", e);
@@ -124,9 +125,17 @@ pub async fn poll_tasks(
         .await
     {
         Ok(Some((task, lease))) => {
+            let environment = match state.secret_repo.get_tenant_secrets(task.tenant_id).await {
+                Ok(environment) => environment,
+                Err(err) => {
+                    tracing::error!("Failed to load task secrets during poll: {:?}", err);
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
             let response = PollResponse {
                 task: Some(task),
                 lease: Some(lease),
+                environment,
             };
             (StatusCode::OK, Json(response)).into_response()
         }
@@ -134,16 +143,13 @@ pub async fn poll_tasks(
             let response = PollResponse {
                 task: None,
                 lease: None,
+                environment: BTreeMap::new(),
             };
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(RepositoryError::Conflict(msg)) => {
             tracing::warn!("Poll rejected: {}", msg);
-            (
-                StatusCode::CONFLICT,
-                Json(json!({ "error": msg })),
-            )
-                .into_response()
+            (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
         }
         Err(e) => {
             tracing::error!("Database error during poll: {:?}", e);
@@ -175,7 +181,11 @@ pub async fn heartbeat_executor(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<HeartbeatRequest>,
 ) -> impl IntoResponse {
-    match state.executor_repo.record_heartbeat(payload.executor_id).await {
+    match state
+        .executor_repo
+        .record_heartbeat(payload.executor_id)
+        .await
+    {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(RepositoryError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
@@ -194,6 +204,7 @@ pub async fn update_task_status(
         "Running" => domain::TaskStatus::Running,
         "Succeeded" => domain::TaskStatus::Succeeded,
         "Failed" => domain::TaskStatus::Failed,
+        "Cancelled" => domain::TaskStatus::Cancelled,
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
 
@@ -229,6 +240,43 @@ pub async fn cancel_task(
         Err(RepositoryError::Conflict(_)) => StatusCode::CONFLICT.into_response(),
         Err(e) => {
             tracing::error!("Database error during cancellation: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn put_rate_limit(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<PutRateLimitRequest>,
+) -> impl IntoResponse {
+    match state
+        .rate_limit_repo
+        .put_rate_limit(payload.tenant_id, &payload.key, payload.max_inflight)
+        .await
+    {
+        Ok(_) => StatusCode::CREATED.into_response(),
+        Err(RepositoryError::Conflict(msg)) => {
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
+        }
+        Err(err) => {
+            tracing::error!("Database error during rate-limit upsert: {:?}", err);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn put_secret(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<PutSecretRequest>,
+) -> impl IntoResponse {
+    match state
+        .secret_repo
+        .put_secret(payload.tenant_id, &payload.key, &payload.value)
+        .await
+    {
+        Ok(_) => StatusCode::CREATED.into_response(),
+        Err(err) => {
+            tracing::error!("Database error during secret upsert: {:?}", err);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }

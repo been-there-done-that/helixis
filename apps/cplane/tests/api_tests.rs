@@ -8,15 +8,18 @@ use domain::{Executor, TaskStatus};
 use http_body_util::BodyExt;
 use persistence::{
     db,
-    repositories::{executor_repo::PostgresExecutorRepository, task_repo::PostgresTaskRepository},
+    repositories::{
+        executor::PostgresExecutorRepository, rate_limit::PostgresRateLimitRepository,
+        secret::PostgresSecretRepository, task::PostgresTaskRepository,
+    },
 };
 use protocol::api::{
-    HeartbeatRequest, PollRequest, PollResponse, RegisterExecutorRequest, TaskResponse,
-    TaskStatusUpdateRequest, TaskSubmitRequest,
+    HeartbeatRequest, PollRequest, PollResponse, PutRateLimitRequest, PutSecretRequest,
+    RegisterExecutorRequest, TaskResponse, TaskStatusUpdateRequest, TaskSubmitRequest,
 };
 use std::env;
 use std::sync::Arc;
-use tower::{Service, ServiceExt};
+use tower::ServiceExt;
 use uuid::Uuid;
 
 async fn setup_db() -> sqlx::PgPool {
@@ -56,6 +59,18 @@ async fn insert_prereqs(pool: &sqlx::PgPool) -> (Uuid, String) {
     (tenant_id, runtime_pack_id)
 }
 
+fn build_state(pool: &sqlx::PgPool) -> Arc<AppState> {
+    Arc::new(AppState {
+        task_repo: Arc::new(PostgresTaskRepository::new(pool.clone())),
+        executor_repo: Arc::new(PostgresExecutorRepository::new(pool.clone())),
+        rate_limit_repo: Arc::new(PostgresRateLimitRepository::new(pool.clone())),
+        secret_repo: Arc::new(PostgresSecretRepository::new(
+            pool.clone(),
+            "test-secret-key",
+        )),
+    })
+}
+
 #[tokio::test]
 async fn test_full_api_flow() {
     let pool = setup_db().await;
@@ -71,13 +86,9 @@ async fn test_full_api_flow() {
     .await
     .unwrap();
 
-    let task_repo = Arc::new(PostgresTaskRepository::new(pool.clone()));
+    let state = build_state(&pool);
     let executor_repo = Arc::new(PostgresExecutorRepository::new(pool.clone()));
-    let state = Arc::new(AppState {
-        task_repo,
-        executor_repo: executor_repo.clone(),
-    });
-    let mut app = app_router(state);
+    let app = app_router(state);
 
     let executor = Executor {
         id: Uuid::new_v4(),
@@ -143,6 +154,7 @@ async fn test_full_api_flow() {
     let body_json: PollResponse = serde_json::from_slice(&body).unwrap();
 
     assert!(body_json.task.is_some());
+    assert!(body_json.environment.is_empty());
     let polled_task = body_json.task.unwrap();
     assert_eq!(polled_task.id, task_id);
     assert_eq!(polled_task.status, TaskStatus::Scheduled);
@@ -223,13 +235,7 @@ async fn test_reject_mismatched_artifact_runtime() {
     .await
     .unwrap();
 
-    let task_repo = Arc::new(PostgresTaskRepository::new(pool.clone()));
-    let executor_repo = Arc::new(PostgresExecutorRepository::new(pool.clone()));
-    let state = Arc::new(AppState {
-        task_repo,
-        executor_repo,
-    });
-    let app = app_router(state);
+    let app = app_router(build_state(&pool));
 
     let submit_req = TaskSubmitRequest {
         tenant_id,
@@ -260,13 +266,7 @@ async fn test_reject_mismatched_artifact_runtime() {
 #[tokio::test]
 async fn test_register_and_heartbeat_endpoints() {
     let pool = setup_db().await;
-    let task_repo = Arc::new(PostgresTaskRepository::new(pool.clone()));
-    let executor_repo = Arc::new(PostgresExecutorRepository::new(pool.clone()));
-    let state = Arc::new(AppState {
-        task_repo,
-        executor_repo,
-    });
-    let app = app_router(state);
+    let app = app_router(build_state(&pool));
 
     let executor_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
@@ -321,13 +321,7 @@ async fn test_cancel_endpoint_marks_task_cancelled() {
     .await
     .unwrap();
 
-    let task_repo = Arc::new(PostgresTaskRepository::new(pool.clone()));
-    let executor_repo = Arc::new(PostgresExecutorRepository::new(pool.clone()));
-    let state = Arc::new(AppState {
-        task_repo,
-        executor_repo,
-    });
-    let app = app_router(state);
+    let app = app_router(build_state(&pool));
 
     let submit_req = TaskSubmitRequest {
         tenant_id,
@@ -384,4 +378,237 @@ async fn test_cancel_endpoint_marks_task_cancelled() {
     let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
     let task_json: TaskResponse = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(task_json.status, TaskStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn test_poll_includes_tenant_secrets() {
+    let pool = setup_db().await;
+    let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
+    let artifact_id = Uuid::new_v4();
+
+    sqlx::query!(
+        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
+        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = app_router(build_state(&pool));
+    let executor_id = Uuid::new_v4();
+
+    let register_req = RegisterExecutorRequest {
+        executor_id,
+        session_id: Uuid::new_v4(),
+        capabilities: vec![runtime_pack.clone()],
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/executors/register")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&register_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let secret_req = PutSecretRequest {
+        tenant_id,
+        key: "API_TOKEN".to_string(),
+        value: "top-secret".to_string(),
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/secrets")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&secret_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let submit_req = TaskSubmitRequest {
+        tenant_id,
+        artifact_id,
+        runtime_pack_id: runtime_pack.clone(),
+        priority: Some(1),
+        rate_limit_key: None,
+        timeout_seconds: Some(30),
+        max_attempts: Some(1),
+        idempotency_key: None,
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&submit_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let poll_req = PollRequest {
+        runtime_pack_id: runtime_pack,
+        executor_id,
+        lease_duration_sec: 60,
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/executors/poll")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&poll_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body_json: PollResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body_json.environment.get("API_TOKEN"),
+        Some(&"top-secret".to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_rate_limit_blocks_second_inflight_task() {
+    let pool = setup_db().await;
+    let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
+    let artifact_id = Uuid::new_v4();
+
+    sqlx::query!(
+        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
+        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = app_router(build_state(&pool));
+    let executor_id = Uuid::new_v4();
+
+    let register_req = RegisterExecutorRequest {
+        executor_id,
+        session_id: Uuid::new_v4(),
+        capabilities: vec![runtime_pack.clone()],
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/executors/register")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&register_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let limit_req = PutRateLimitRequest {
+        tenant_id,
+        key: "customer-123".to_string(),
+        max_inflight: 1,
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/rate-limits")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&limit_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    for _ in 0..2 {
+        let submit_req = TaskSubmitRequest {
+            tenant_id,
+            artifact_id,
+            runtime_pack_id: runtime_pack.clone(),
+            priority: Some(1),
+            rate_limit_key: Some("customer-123".to_string()),
+            timeout_seconds: Some(30),
+            max_attempts: Some(1),
+            idempotency_key: None,
+        };
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&submit_req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let poll_req = PollRequest {
+        runtime_pack_id: runtime_pack.clone(),
+        executor_id,
+        lease_duration_sec: 60,
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/executors/poll")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&poll_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let first_poll: PollResponse = serde_json::from_slice(&body).unwrap();
+    assert!(first_poll.task.is_some());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/executors/poll")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&poll_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let second_poll: PollResponse = serde_json::from_slice(&body).unwrap();
+    assert!(second_poll.task.is_none());
 }
