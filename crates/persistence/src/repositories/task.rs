@@ -1,8 +1,7 @@
 use application::ports::repositories::{RepositoryError, TaskRepository};
 use async_trait::async_trait;
 use domain::{Task, TaskLease, TaskStatus};
-use sqlx::PgPool;
-use tracing::instrument;
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 pub struct PostgresTaskRepository {
@@ -17,7 +16,6 @@ impl PostgresTaskRepository {
 
 #[async_trait]
 impl TaskRepository for PostgresTaskRepository {
-    #[instrument(skip(self), fields(task_id = %id))]
     async fn get_task(&self, id: Uuid) -> Result<Option<Task>, RepositoryError> {
         let row = sqlx::query!("SELECT * FROM tasks WHERE id = $1", id)
             .fetch_optional(&self.pool)
@@ -57,7 +55,6 @@ impl TaskRepository for PostgresTaskRepository {
         }))
     }
 
-    #[instrument(skip(self), fields(task_id = %task.id, tenant_id = %task.tenant_id))]
     async fn insert_task(&self, task: &Task) -> Result<(), RepositoryError> {
         let status_str = match task.status {
             TaskStatus::Queued => "Queued",
@@ -129,7 +126,6 @@ impl TaskRepository for PostgresTaskRepository {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(executor_id = %executor_id, runtime_pack_id))]
     async fn poll_and_lease(
         &self,
         runtime_pack_id: &str,
@@ -142,32 +138,6 @@ impl TaskRepository for PostgresTaskRepository {
             .await
             .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
 
-        let row = sqlx::query!(
-            r#"
-            UPDATE tasks
-            SET status = 'Scheduled', updated_at = NOW()
-            WHERE id = (
-                SELECT id FROM tasks 
-                WHERE status = 'Queued' AND runtime_pack_id = $1 
-                ORDER BY priority DESC, created_at ASC
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
-            RETURNING *
-            "#,
-            runtime_pack_id
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
-
-        let row = match row {
-            Some(r) => r,
-            None => return Ok(None),
-        };
-
-        let task_id = row.id;
-        let lease_id = Uuid::new_v4();
         let executor_exists = sqlx::query_scalar!(
             "SELECT EXISTS (SELECT 1 FROM executors WHERE id = $1)",
             executor_id
@@ -205,6 +175,56 @@ impl TaskRepository for PostgresTaskRepository {
             ));
         }
 
+        let row = sqlx::query(
+            r#"
+            UPDATE tasks
+            SET status = 'Scheduled', scheduled_at = NOW(), updated_at = NOW()
+            WHERE id = (
+                SELECT candidate.id
+                FROM tasks candidate
+                WHERE candidate.status = 'Queued'
+                  AND candidate.runtime_pack_id = $1
+                  AND (
+                    candidate.rate_limit_key IS NULL
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM rate_limits rl
+                        WHERE rl.tenant_id = candidate.tenant_id
+                          AND rl.rate_limit_key = candidate.rate_limit_key
+                          AND (
+                            SELECT COUNT(*)
+                            FROM tasks active
+                            WHERE active.tenant_id = candidate.tenant_id
+                              AND active.rate_limit_key = candidate.rate_limit_key
+                              AND active.status IN ('Scheduled', 'Running')
+                          ) >= rl.max_inflight
+                    )
+                  )
+                ORDER BY candidate.priority DESC, candidate.created_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            )
+            RETURNING *
+            "#,
+        )
+        .bind(runtime_pack_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+        let row = match row {
+            Some(r) => r,
+            None => {
+                tx.commit()
+                    .await
+                    .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+                return Ok(None);
+            }
+        };
+
+        let task_id: Uuid = row.get("id");
+        let lease_id = Uuid::new_v4();
+
         // Use a simple string building approach for the interval
         let query_str = format!(
             "INSERT INTO task_leases (id, task_id, executor_id, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '{} seconds')",
@@ -225,17 +245,17 @@ impl TaskRepository for PostgresTaskRepository {
         let status = TaskStatus::Scheduled;
 
         let task = Task {
-            id: row.id,
-            tenant_id: row.tenant_id,
-            artifact_id: row.artifact_id,
-            runtime_pack_id: row.runtime_pack_id,
+            id: row.get("id"),
+            tenant_id: row.get("tenant_id"),
+            artifact_id: row.get("artifact_id"),
+            runtime_pack_id: row.get("runtime_pack_id"),
             status,
-            priority: row.priority,
-            rate_limit_key: row.rate_limit_key,
-            timeout_seconds: row.timeout_seconds,
-            max_attempts: row.max_attempts,
-            current_attempt: row.current_attempt,
-            idempotency_key: row.idempotency_key,
+            priority: row.get("priority"),
+            rate_limit_key: row.get("rate_limit_key"),
+            timeout_seconds: row.get("timeout_seconds"),
+            max_attempts: row.get("max_attempts"),
+            current_attempt: row.get("current_attempt"),
+            idempotency_key: row.get("idempotency_key"),
         };
 
         let lease = TaskLease {
@@ -247,7 +267,6 @@ impl TaskRepository for PostgresTaskRepository {
         Ok(Some((task, lease)))
     }
 
-    #[instrument(skip(self), fields(task_id = %id, status))]
     async fn update_task_status(
         &self,
         id: Uuid,
@@ -411,7 +430,6 @@ impl TaskRepository for PostgresTaskRepository {
         Ok(())
     }
 
-    #[instrument(skip(self))]
     async fn requeue_expired_leases(&self) -> Result<u64, RepositoryError> {
         let mut tx = self
             .pool
@@ -486,7 +504,6 @@ impl TaskRepository for PostgresTaskRepository {
         Ok(expired.len() as u64)
     }
 
-    #[instrument(skip(self), fields(task_id = %id))]
     async fn cancel_task(&self, id: Uuid) -> Result<(), RepositoryError> {
         let result = sqlx::query!(
             r#"

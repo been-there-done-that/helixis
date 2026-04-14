@@ -3,6 +3,7 @@ use protocol::api::{
     HeartbeatRequest, PollRequest, PollResponse, RegisterExecutorRequest, TaskStatusUpdateRequest,
 };
 use reqwest::{Client, Url};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -76,7 +77,7 @@ impl CplaneClient {
         &self,
         runtime_pack_id: &str,
         lease_duration_sec: i32,
-    ) -> Result<Option<(Task, TaskLease)>, ClientError> {
+    ) -> Result<Option<(Task, TaskLease, BTreeMap<String, String>)>, ClientError> {
         let url = self
             .base_url
             .join("/v1/executors/poll")
@@ -99,7 +100,7 @@ impl CplaneClient {
         let poll_response: PollResponse = response.json().await?;
 
         if let (Some(task), Some(lease)) = (poll_response.task, poll_response.lease) {
-            Ok(Some((task, lease)))
+            Ok(Some((task, lease, poll_response.environment)))
         } else {
             Ok(None)
         }

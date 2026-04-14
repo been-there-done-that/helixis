@@ -1,4 +1,6 @@
-use application::ports::repositories::{ExecutorRepository, RepositoryError, TaskRepository};
+use application::ports::repositories::{
+    ExecutorRepository, RateLimitRepository, RepositoryError, SecretRepository, TaskRepository,
+};
 use axum::{
     Json,
     extract::{Path, State},
@@ -6,15 +8,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use protocol::api::{
-    HeartbeatRequest, PollRequest, PollResponse, RegisterExecutorRequest, TaskResponse,
-    TaskStatusUpdateRequest, TaskSubmitRequest,
+    HeartbeatRequest, PollRequest, PollResponse, PutRateLimitRequest, PutSecretRequest,
+    RegisterExecutorRequest, TaskResponse, TaskStatusUpdateRequest, TaskSubmitRequest,
 };
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-#[tracing::instrument]
 pub async fn health() -> impl IntoResponse {
     let uptime = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -32,6 +34,8 @@ pub async fn health() -> impl IntoResponse {
 pub struct AppState {
     pub task_repo: Arc<dyn TaskRepository>,
     pub executor_repo: Arc<dyn ExecutorRepository>,
+    pub rate_limit_repo: Arc<dyn RateLimitRepository>,
+    pub secret_repo: Arc<dyn SecretRepository>,
 }
 
 pub enum ApiError {
@@ -64,7 +68,6 @@ impl From<RepositoryError> for ApiError {
     }
 }
 
-#[tracing::instrument(name = "submit_task", skip_all, fields(tenant_id, artifact_id))]
 pub async fn submit_task(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<TaskSubmitRequest>,
@@ -72,9 +75,9 @@ pub async fn submit_task(
     let task_id = Uuid::new_v4();
     let task = domain::Task {
         id: task_id,
-        tenant_id: payload.tenant_id.clone(),
-        artifact_id: payload.artifact_id.clone(),
-        runtime_pack_id: payload.runtime_pack_id.clone(),
+        tenant_id: payload.tenant_id,
+        artifact_id: payload.artifact_id,
+        runtime_pack_id: payload.runtime_pack_id,
         status: domain::TaskStatus::Queued,
         priority: payload.priority.unwrap_or(0),
         rate_limit_key: payload.rate_limit_key,
@@ -86,7 +89,6 @@ pub async fn submit_task(
 
     match state.task_repo.insert_task(&task).await {
         Ok(_) => {
-            tracing::info!(task_id = %task.id, "Task submitted successfully");
             let response = TaskResponse {
                 id: task.id,
                 status: task.status,
@@ -95,11 +97,7 @@ pub async fn submit_task(
         }
         Err(RepositoryError::Conflict(msg)) => {
             tracing::warn!("Task submission rejected: {}", msg);
-            (
-                StatusCode::CONFLICT,
-                Json(json!({ "error": msg })),
-            )
-                .into_response()
+            (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
         }
         Err(e) => {
             tracing::error!("Database error: {:?}", e);
@@ -108,7 +106,6 @@ pub async fn submit_task(
     }
 }
 
-#[tracing::instrument(name = "get_task", skip_all, fields(task_id))]
 pub async fn get_task(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -129,7 +126,6 @@ pub async fn get_task(
     }
 }
 
-#[tracing::instrument(name = "poll_tasks", skip_all, fields(executor_id, runtime_pack_id))]
 pub async fn poll_tasks(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<PollRequest>,
@@ -144,10 +140,17 @@ pub async fn poll_tasks(
         .await
     {
         Ok(Some((task, lease))) => {
-            tracing::debug!(task_id = %task.id, "Task leased to executor");
+            let environment = match state.secret_repo.get_tenant_secrets(task.tenant_id).await {
+                Ok(environment) => environment,
+                Err(err) => {
+                    tracing::error!("Failed to load task secrets during poll: {:?}", err);
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
             let response = PollResponse {
                 task: Some(task),
                 lease: Some(lease),
+                environment,
             };
             (StatusCode::OK, Json(response)).into_response()
         }
@@ -155,16 +158,13 @@ pub async fn poll_tasks(
             let response = PollResponse {
                 task: None,
                 lease: None,
+                environment: BTreeMap::new(),
             };
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(RepositoryError::Conflict(msg)) => {
             tracing::warn!("Poll rejected: {}", msg);
-            (
-                StatusCode::CONFLICT,
-                Json(json!({ "error": msg })),
-            )
-                .into_response()
+            (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
         }
         Err(e) => {
             tracing::error!("Database error during poll: {:?}", e);
@@ -173,7 +173,6 @@ pub async fn poll_tasks(
     }
 }
 
-#[tracing::instrument(name = "register_executor", skip_all, fields(executor_id))]
 pub async fn register_executor(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<RegisterExecutorRequest>,
@@ -185,10 +184,7 @@ pub async fn register_executor(
     };
 
     match state.executor_repo.upsert_executor(&executor).await {
-        Ok(_) => {
-            tracing::info!(executor_id = %executor.id, "Executor registered");
-            StatusCode::CREATED.into_response()
-        }
+        Ok(_) => StatusCode::CREATED.into_response(),
         Err(e) => {
             tracing::error!("Database error during executor registration: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -196,12 +192,15 @@ pub async fn register_executor(
     }
 }
 
-#[tracing::instrument(name = "heartbeat_executor", skip_all, fields(executor_id))]
 pub async fn heartbeat_executor(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<HeartbeatRequest>,
 ) -> impl IntoResponse {
-    match state.executor_repo.record_heartbeat(payload.executor_id).await {
+    match state
+        .executor_repo
+        .record_heartbeat(payload.executor_id)
+        .await
+    {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(RepositoryError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
@@ -211,7 +210,6 @@ pub async fn heartbeat_executor(
     }
 }
 
-#[tracing::instrument(name = "update_task_status", skip_all, fields(task_id, status))]
 pub async fn update_task_status(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
@@ -221,6 +219,7 @@ pub async fn update_task_status(
         "Running" => domain::TaskStatus::Running,
         "Succeeded" => domain::TaskStatus::Succeeded,
         "Failed" => domain::TaskStatus::Failed,
+        "Cancelled" => domain::TaskStatus::Cancelled,
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
 
@@ -237,10 +236,7 @@ pub async fn update_task_status(
         )
         .await
     {
-        Ok(_) => {
-            tracing::info!(task_id = %id, status = %payload.status, "Task status updated");
-            StatusCode::NO_CONTENT.into_response()
-        }
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(RepositoryError::Conflict(_)) => StatusCode::CONFLICT.into_response(),
         Err(e) => {
             tracing::error!("Database error during status update: {:?}", e);
@@ -249,20 +245,53 @@ pub async fn update_task_status(
     }
 }
 
-#[tracing::instrument(name = "cancel_task", skip_all, fields(task_id))]
 pub async fn cancel_task(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
     match state.task_repo.cancel_task(id).await {
-        Ok(_) => {
-            tracing::info!(task_id = %id, "Task cancelled");
-            StatusCode::NO_CONTENT.into_response()
-        }
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(RepositoryError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(RepositoryError::Conflict(_)) => StatusCode::CONFLICT.into_response(),
         Err(e) => {
             tracing::error!("Database error during cancellation: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn put_rate_limit(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<PutRateLimitRequest>,
+) -> impl IntoResponse {
+    match state
+        .rate_limit_repo
+        .put_rate_limit(payload.tenant_id, &payload.key, payload.max_inflight)
+        .await
+    {
+        Ok(_) => StatusCode::CREATED.into_response(),
+        Err(RepositoryError::Conflict(msg)) => {
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
+        }
+        Err(err) => {
+            tracing::error!("Database error during rate-limit upsert: {:?}", err);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn put_secret(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<PutSecretRequest>,
+) -> impl IntoResponse {
+    match state
+        .secret_repo
+        .put_secret(payload.tenant_id, &payload.key, &payload.value)
+        .await
+    {
+        Ok(_) => StatusCode::CREATED.into_response(),
+        Err(err) => {
+            tracing::error!("Database error during secret upsert: {:?}", err);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
