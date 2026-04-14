@@ -1,12 +1,13 @@
 use application::ports::repositories::{
-    ExecutorRepository, RateLimitRepository, SecretRepository, TaskRepository,
+    ArtifactRepository, ExecutorRepository, RateLimitRepository, SecretRepository, TaskRepository,
 };
 use domain::{Executor, Task, TaskStatus};
 use persistence::{
     db,
     repositories::{
-        executor::PostgresExecutorRepository, rate_limit::PostgresRateLimitRepository,
-        secret::PostgresSecretRepository, task::PostgresTaskRepository,
+        artifact::PostgresArtifactRepository, executor::PostgresExecutorRepository,
+        rate_limit::PostgresRateLimitRepository, secret::PostgresSecretRepository,
+        task::PostgresTaskRepository,
     },
 };
 use sqlx::PgPool;
@@ -83,10 +84,12 @@ async fn test_insert_and_poll() {
         status: TaskStatus::Queued,
         priority: 10,
         rate_limit_key: None,
+        payload_ref: None,
         timeout_seconds: 300,
         max_attempts: 3,
         current_attempt: 0,
         idempotency_key: None,
+        payload_size_bytes: None,
     };
 
     task_repo.insert_task(&task).await.unwrap();
@@ -166,10 +169,12 @@ async fn test_requeue_expired_lease() {
         status: TaskStatus::Queued,
         priority: 1,
         rate_limit_key: None,
+        payload_ref: None,
         timeout_seconds: 60,
         max_attempts: 3,
         current_attempt: 0,
         idempotency_key: None,
+        payload_size_bytes: None,
     };
 
     task_repo.insert_task(&task).await.unwrap();
@@ -239,10 +244,12 @@ async fn test_stale_executor_cannot_poll() {
         status: TaskStatus::Queued,
         priority: 1,
         rate_limit_key: None,
+        payload_ref: None,
         timeout_seconds: 60,
         max_attempts: 3,
         current_attempt: 0,
         idempotency_key: None,
+        payload_size_bytes: None,
     };
 
     task_repo.insert_task(&task).await.unwrap();
@@ -288,10 +295,12 @@ async fn test_rate_limit_prevents_second_lease() {
             status: TaskStatus::Queued,
             priority: 1,
             rate_limit_key: Some("customer-123".to_string()),
+            payload_ref: None,
             timeout_seconds: 60,
             max_attempts: 3,
             current_attempt: 0,
             idempotency_key: None,
+            payload_size_bytes: None,
         };
 
         task_repo.insert_task(&task).await.unwrap();
@@ -323,4 +332,100 @@ async fn test_secret_round_trip() {
 
     let secrets = secret_repo.get_tenant_secrets(tenant_id).await.unwrap();
     assert_eq!(secrets.get("API_TOKEN"), Some(&"top-secret".to_string()));
+}
+
+#[tokio::test]
+async fn test_artifact_round_trip() {
+    let pool = setup_db().await;
+    let (tenant_id, _, runtime_pack_id) = insert_prereqs(&pool).await;
+    let artifact_repo = PostgresArtifactRepository::new(pool.clone());
+
+    let artifact = domain::Artifact {
+        id: Uuid::new_v4(),
+        tenant_id,
+        digest: format!("sha256:{}", Uuid::new_v4()),
+        runtime_pack_id,
+        entrypoint: "main.py".to_string(),
+        size_bytes: 42,
+    };
+
+    artifact_repo.insert_artifact(&artifact).await.unwrap();
+    let fetched = artifact_repo
+        .get_artifact(artifact.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.digest, artifact.digest);
+}
+
+#[tokio::test]
+async fn test_get_task_outputs() {
+    let pool = setup_db().await;
+    let task_repo = PostgresTaskRepository::new(pool.clone());
+    let executor_repo = PostgresExecutorRepository::new(pool.clone());
+
+    let (tenant_id, artifact_id, runtime_pack_id) = insert_prereqs(&pool).await;
+    let executor = Executor {
+        id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+        capabilities: vec![runtime_pack_id.clone()],
+    };
+    executor_repo.upsert_executor(&executor).await.unwrap();
+
+    let task = Task {
+        id: Uuid::new_v4(),
+        tenant_id,
+        artifact_id,
+        runtime_pack_id: runtime_pack_id.clone(),
+        status: TaskStatus::Queued,
+        priority: 1,
+        rate_limit_key: None,
+        payload_ref: None,
+        timeout_seconds: 60,
+        max_attempts: 1,
+        current_attempt: 0,
+        idempotency_key: None,
+        payload_size_bytes: None,
+    };
+    task_repo.insert_task(&task).await.unwrap();
+
+    let (_polled, lease) = task_repo
+        .poll_and_lease(&runtime_pack_id, executor.id, 60)
+        .await
+        .unwrap()
+        .unwrap();
+
+    task_repo
+        .update_task_status(
+            task.id,
+            lease.id,
+            executor.id,
+            TaskStatus::Running,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    task_repo
+        .update_task_status(
+            task.id,
+            lease.id,
+            executor.id,
+            TaskStatus::TimedOut,
+            Some("tasks/test/logs.txt".to_string()),
+            Some("tasks/test/result.json".to_string()),
+            Some("timed out".to_string()),
+        )
+        .await
+        .unwrap();
+
+    let outputs = task_repo.get_task_outputs(task.id).await.unwrap().unwrap();
+    assert_eq!(outputs.status, TaskStatus::TimedOut);
+    assert_eq!(outputs.logs_ref.as_deref(), Some("tasks/test/logs.txt"));
+    assert_eq!(
+        outputs.result_ref.as_deref(),
+        Some("tasks/test/result.json")
+    );
 }

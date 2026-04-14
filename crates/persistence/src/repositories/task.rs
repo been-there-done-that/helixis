@@ -1,6 +1,6 @@
 use application::ports::repositories::{RepositoryError, TaskRepository};
 use async_trait::async_trait;
-use domain::{Task, TaskLease, TaskStatus};
+use domain::{Task, TaskLease, TaskOutputs, TaskStatus};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -48,10 +48,60 @@ impl TaskRepository for PostgresTaskRepository {
             status,
             priority: row.priority,
             rate_limit_key: row.rate_limit_key,
+            payload_ref: row.payload_ref,
             timeout_seconds: row.timeout_seconds,
             max_attempts: row.max_attempts,
             current_attempt: row.current_attempt,
             idempotency_key: row.idempotency_key,
+            payload_size_bytes: row.payload_size_bytes,
+        }))
+    }
+
+    async fn get_task_outputs(&self, id: Uuid) -> Result<Option<TaskOutputs>, RepositoryError> {
+        let row = sqlx::query!(
+            r#"
+            SELECT
+                t.id,
+                t.status,
+                t.result_ref,
+                (
+                    SELECT ta.logs_ref
+                    FROM task_attempts ta
+                    WHERE ta.task_id = t.id
+                    ORDER BY ta.started_at DESC
+                    LIMIT 1
+                ) AS logs_ref
+            FROM tasks t
+            WHERE t.id = $1
+            "#,
+            id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+        let row = match row {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+
+        let status = match row.status.as_str() {
+            "Queued" => TaskStatus::Queued,
+            "Scheduled" => TaskStatus::Scheduled,
+            "Running" => TaskStatus::Running,
+            "Succeeded" => TaskStatus::Succeeded,
+            "Failed" => TaskStatus::Failed,
+            "Cancelled" => TaskStatus::Cancelled,
+            "TimedOut" => TaskStatus::TimedOut,
+            "DeadLetter" => TaskStatus::DeadLetter,
+            _ => TaskStatus::Failed,
+        };
+
+        Ok(Some(TaskOutputs {
+            task_id: row.id,
+            status,
+            logs_ref: row.logs_ref,
+            result_ref: row.result_ref,
         }))
     }
 
@@ -77,10 +127,12 @@ impl TaskRepository for PostgresTaskRepository {
                 status,
                 priority,
                 rate_limit_key,
+                payload_ref,
                 timeout_seconds,
                 max_attempts,
                 current_attempt,
-                idempotency_key
+                idempotency_key,
+                payload_size_bytes
             )
             SELECT
                 $1,
@@ -93,7 +145,9 @@ impl TaskRepository for PostgresTaskRepository {
                 $8,
                 $9,
                 $10,
-                $11
+                $11,
+                $12,
+                $13
             WHERE EXISTS (
                 SELECT 1
                 FROM artifacts
@@ -109,10 +163,12 @@ impl TaskRepository for PostgresTaskRepository {
             status_str,
             task.priority,
             task.rate_limit_key,
+            task.payload_ref,
             task.timeout_seconds,
             task.max_attempts,
             task.current_attempt,
-            task.idempotency_key
+            task.idempotency_key,
+            task.payload_size_bytes
         )
         .execute(&self.pool)
         .await
@@ -252,10 +308,12 @@ impl TaskRepository for PostgresTaskRepository {
             status,
             priority: row.get("priority"),
             rate_limit_key: row.get("rate_limit_key"),
+            payload_ref: row.get("payload_ref"),
             timeout_seconds: row.get("timeout_seconds"),
             max_attempts: row.get("max_attempts"),
             current_attempt: row.get("current_attempt"),
             idempotency_key: row.get("idempotency_key"),
+            payload_size_bytes: row.get("payload_size_bytes"),
         };
 
         let lease = TaskLease {
