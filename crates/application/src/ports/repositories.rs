@@ -17,6 +17,7 @@ pub enum RepositoryError {
 pub trait TaskRepository: Send + Sync {
     async fn get_task(&self, id: Uuid) -> Result<Option<Task>, RepositoryError>;
     async fn get_task_outputs(&self, id: Uuid) -> Result<Option<TaskOutputs>, RepositoryError>;
+    async fn list_task_log_chunks(&self, id: Uuid) -> Result<Vec<String>, RepositoryError>;
 
     async fn insert_task(&self, task: &Task) -> Result<(), RepositoryError>;
 
@@ -42,6 +43,15 @@ pub trait TaskRepository: Send + Sync {
     async fn requeue_expired_leases(&self) -> Result<u64, RepositoryError>;
 
     async fn cancel_task(&self, id: Uuid) -> Result<(), RepositoryError>;
+
+    async fn append_task_log_chunk(
+        &self,
+        id: Uuid,
+        lease_id: Uuid,
+        executor_id: Uuid,
+        stream: &str,
+        chunk: &str,
+    ) -> Result<(), RepositoryError>;
 }
 
 #[async_trait]

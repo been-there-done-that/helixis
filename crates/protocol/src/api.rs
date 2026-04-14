@@ -49,6 +49,7 @@ pub struct PollRequest {
 pub struct PollResponse {
     pub task: Option<Task>,
     pub lease: Option<TaskLease>,
+    pub artifact: Option<Artifact>,
     pub environment: BTreeMap<String, String>,
     pub payload: Option<Value>,
 }
