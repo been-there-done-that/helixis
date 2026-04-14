@@ -12,9 +12,8 @@ use uuid::Uuid;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    telemetry::init_logging();
 
-    // Use a dynamic secure UUID internally mapped to runtime pack provided via env or fallback
     let executor_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
     tracing::info!("Starting Helixis Executor Agent [{executor_id}]...");
@@ -45,11 +44,12 @@ async fn main() {
         .expect("Failed to register executor");
 
     let heartbeat_client = Arc::clone(&client);
+    let heartbeat_executor_id = executor_id;
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(15)).await;
             if let Err(err) = heartbeat_client.send_heartbeat().await {
-                tracing::warn!("Executor heartbeat failed: {}", err);
+                tracing::warn!(executor_id = %heartbeat_executor_id, "Executor heartbeat failed: {}", err);
             }
         }
     });
@@ -59,33 +59,35 @@ async fn main() {
         runtime_pack_id
     );
 
-    let mut consecutive_empty_polls = 0;
+    let mut consecutive_empty_polls = 0u32;
 
     loop {
+        let span = tracing::info_span!("poll_loop", runtime_pack_id = %runtime_pack_id);
+        let _enter = span.enter();
+
         tracing::debug!("Polling queue...");
 
         match client.poll_task(&runtime_pack_id, 120).await {
             Ok(Some((task, lease))) => {
                 consecutive_empty_polls = 0;
-                tracing::info!("Acquired task {}! Executing now...", task.id);
+                tracing::info!(task_id = %task.id, "Acquired task! Executing now...");
 
                 if let Err(err) = client
                     .report_status(task.id, lease.id, "Running", None, None, None)
                     .await
                 {
-                    tracing::error!("Failed to mark task {} as running: {}", task.id, err);
+                    tracing::error!(task_id = %task.id, "Failed to mark task as running: {}", err);
                     sleep(Duration::from_secs(1)).await;
                     continue;
                 }
 
-                // Execute mock task
+                let task_span = tracing::info_span!("execute_task", task_id = %task.id);
+                let _enter = task_span.enter();
+
                 match sandbox.execute(&task, &lease, Arc::clone(&client)).await {
                     Ok(outcome) => {
                         let status_name = format!("{:?}", outcome.status);
-                        tracing::info!(
-                            "Execution finished with status {}. Reporting to cplane...",
-                            status_name
-                        );
+                        tracing::info!(task_id = %task.id, status = %status_name, "Task executed");
                         if let Err(e) = client
                             .report_status(
                                 task.id,
@@ -97,11 +99,11 @@ async fn main() {
                             )
                             .await
                         {
-                            tracing::error!("Failed to report {} status: {}", status_name, e);
+                            tracing::error!(task_id = %task.id, status = %status_name, "Failed to report status: {}", e);
                         }
                     }
                     Err(e) => {
-                        tracing::error!("Execution infrastructure failed: {}. Reporting failure...", e);
+                        tracing::error!(task_id = %task.id, "Execution failed: {}", e);
                         if let Err(err) = client
                             .report_status(
                                 task.id,
@@ -113,25 +115,25 @@ async fn main() {
                             )
                             .await
                         {
-                            tracing::error!("Failed to report Failed status: {}", err);
+                            tracing::error!(task_id = %task.id, "Failed to report Failed status: {}", err);
                         }
                     }
                 }
             }
             Ok(None) => {
                 consecutive_empty_polls += 1;
-                // Exponential backoff: 2, 4, 8, 16... max 30 seconds
                 let delay = std::cmp::min(1 << consecutive_empty_polls, 30);
-                tracing::trace!("Queue is empty. Sleeping {} seconds...", delay);
+                tracing::trace!(empty_polls = consecutive_empty_polls, delay_seconds = delay, "No tasks available");
                 sleep(Duration::from_secs(delay as u64)).await;
             }
             Err(e) => {
                 consecutive_empty_polls += 1;
                 let delay = std::cmp::min(1 << consecutive_empty_polls, 30);
                 tracing::error!(
-                    "Failed to poll control plane: {}. Retrying in {} seconds...",
-                    e,
-                    delay
+                    empty_polls = consecutive_empty_polls,
+                    delay_seconds = delay,
+                    "Failed to poll control plane: {}",
+                    e
                 );
                 sleep(Duration::from_secs(delay as u64)).await;
             }

@@ -2,6 +2,7 @@ use application::ports::repositories::{RepositoryError, TaskRepository};
 use async_trait::async_trait;
 use domain::{Task, TaskLease, TaskStatus};
 use sqlx::PgPool;
+use tracing::instrument;
 use uuid::Uuid;
 
 pub struct PostgresTaskRepository {
@@ -16,6 +17,7 @@ impl PostgresTaskRepository {
 
 #[async_trait]
 impl TaskRepository for PostgresTaskRepository {
+    #[instrument(skip(self), fields(task_id = %id))]
     async fn get_task(&self, id: Uuid) -> Result<Option<Task>, RepositoryError> {
         let row = sqlx::query!("SELECT * FROM tasks WHERE id = $1", id)
             .fetch_optional(&self.pool)
@@ -55,6 +57,7 @@ impl TaskRepository for PostgresTaskRepository {
         }))
     }
 
+    #[instrument(skip(self), fields(task_id = %task.id, tenant_id = %task.tenant_id))]
     async fn insert_task(&self, task: &Task) -> Result<(), RepositoryError> {
         let status_str = match task.status {
             TaskStatus::Queued => "Queued",
@@ -126,6 +129,7 @@ impl TaskRepository for PostgresTaskRepository {
         Ok(())
     }
 
+    #[instrument(skip(self), fields(executor_id = %executor_id, runtime_pack_id))]
     async fn poll_and_lease(
         &self,
         runtime_pack_id: &str,
@@ -243,6 +247,7 @@ impl TaskRepository for PostgresTaskRepository {
         Ok(Some((task, lease)))
     }
 
+    #[instrument(skip(self), fields(task_id = %id, status))]
     async fn update_task_status(
         &self,
         id: Uuid,
@@ -406,6 +411,7 @@ impl TaskRepository for PostgresTaskRepository {
         Ok(())
     }
 
+    #[instrument(skip(self))]
     async fn requeue_expired_leases(&self) -> Result<u64, RepositoryError> {
         let mut tx = self
             .pool
@@ -480,6 +486,7 @@ impl TaskRepository for PostgresTaskRepository {
         Ok(expired.len() as u64)
     }
 
+    #[instrument(skip(self), fields(task_id = %id))]
     async fn cancel_task(&self, id: Uuid) -> Result<(), RepositoryError> {
         let result = sqlx::query!(
             r#"

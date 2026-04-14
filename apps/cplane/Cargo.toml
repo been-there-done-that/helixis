@@ -16,6 +16,7 @@ persistence = { path = "../../crates/persistence" }
 dotenvy = "0.15"
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }
+telemetry = { path = "../../crates/telemetry" }
 
 [dev-dependencies]
 tower = { version = "0.4.13", features = ["util"] }
