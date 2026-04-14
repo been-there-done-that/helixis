@@ -105,6 +105,30 @@ impl TaskRepository for PostgresTaskRepository {
         }))
     }
 
+    async fn list_task_log_chunks(&self, id: Uuid) -> Result<Vec<String>, RepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT stream, chunk
+            FROM task_log_chunks
+            WHERE task_id = $1
+            ORDER BY chunk_index ASC
+            "#,
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let stream: String = row.get("stream");
+                let chunk: String = row.get("chunk");
+                format!("[{stream}] {chunk}")
+            })
+            .collect())
+    }
+
     async fn insert_task(&self, task: &Task) -> Result<(), RepositoryError> {
         let status_str = match task.status {
             TaskStatus::Queued => "Queued",
@@ -593,5 +617,57 @@ impl TaskRepository for PostgresTaskRepository {
         } else {
             Err(RepositoryError::NotFound)
         }
+    }
+
+    async fn append_task_log_chunk(
+        &self,
+        id: Uuid,
+        lease_id: Uuid,
+        executor_id: Uuid,
+        stream: &str,
+        chunk: &str,
+    ) -> Result<(), RepositoryError> {
+        let lease_exists = sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM task_leases
+                WHERE id = $1
+                  AND task_id = $2
+                  AND executor_id = $3
+            )
+            "#,
+            lease_id,
+            id,
+            executor_id
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?
+        .unwrap_or(false);
+
+        if !lease_exists {
+            return Err(RepositoryError::Conflict(
+                "no active lease matches this log append".to_string(),
+            ));
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO task_log_chunks (id, task_id, lease_id, executor_id, stream, chunk)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(id)
+        .bind(lease_id)
+        .bind(executor_id)
+        .bind(stream)
+        .bind(chunk)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::DatabaseError(e.to_string()))?;
+
+        Ok(())
     }
 }

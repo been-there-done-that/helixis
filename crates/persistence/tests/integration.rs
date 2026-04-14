@@ -429,3 +429,53 @@ async fn test_get_task_outputs() {
         Some("tasks/test/result.json")
     );
 }
+
+#[tokio::test]
+async fn test_append_and_list_task_log_chunks() {
+    let pool = setup_db().await;
+    let task_repo = PostgresTaskRepository::new(pool.clone());
+    let executor_repo = PostgresExecutorRepository::new(pool.clone());
+
+    let (tenant_id, artifact_id, runtime_pack_id) = insert_prereqs(&pool).await;
+    let executor = Executor {
+        id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+        capabilities: vec![runtime_pack_id.clone()],
+    };
+    executor_repo.upsert_executor(&executor).await.unwrap();
+
+    let task = Task {
+        id: Uuid::new_v4(),
+        tenant_id,
+        artifact_id,
+        runtime_pack_id: runtime_pack_id.clone(),
+        status: TaskStatus::Queued,
+        priority: 1,
+        rate_limit_key: None,
+        payload_ref: None,
+        timeout_seconds: 60,
+        max_attempts: 1,
+        current_attempt: 0,
+        idempotency_key: None,
+        payload_size_bytes: None,
+    };
+    task_repo.insert_task(&task).await.unwrap();
+
+    let (_polled, lease) = task_repo
+        .poll_and_lease(&runtime_pack_id, executor.id, 60)
+        .await
+        .unwrap()
+        .unwrap();
+
+    task_repo
+        .append_task_log_chunk(task.id, lease.id, executor.id, "stdout", "hello")
+        .await
+        .unwrap();
+    task_repo
+        .append_task_log_chunk(task.id, lease.id, executor.id, "stderr", "world")
+        .await
+        .unwrap();
+
+    let chunks = task_repo.list_task_log_chunks(task.id).await.unwrap();
+    assert_eq!(chunks, vec!["[stdout] hello", "[stderr] world"]);
+}
