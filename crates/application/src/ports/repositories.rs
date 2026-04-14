@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use domain::{Executor, Task, TaskLease, TaskStatus};
+use domain::{
+    Artifact, ArtifactUploadSession, Executor, PayloadObject, PayloadUploadSession, Task,
+    TaskLease, TaskOutputs, TaskStatus,
+};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
@@ -16,6 +19,8 @@ pub enum RepositoryError {
 #[async_trait]
 pub trait TaskRepository: Send + Sync {
     async fn get_task(&self, id: Uuid) -> Result<Option<Task>, RepositoryError>;
+    async fn get_task_outputs(&self, id: Uuid) -> Result<Option<TaskOutputs>, RepositoryError>;
+    async fn list_task_log_chunks(&self, id: Uuid) -> Result<Vec<String>, RepositoryError>;
 
     async fn insert_task(&self, task: &Task) -> Result<(), RepositoryError>;
 
@@ -41,12 +46,57 @@ pub trait TaskRepository: Send + Sync {
     async fn requeue_expired_leases(&self) -> Result<u64, RepositoryError>;
 
     async fn cancel_task(&self, id: Uuid) -> Result<(), RepositoryError>;
+
+    async fn append_task_log_chunk(
+        &self,
+        id: Uuid,
+        lease_id: Uuid,
+        executor_id: Uuid,
+        stream: &str,
+        chunk: &str,
+    ) -> Result<(), RepositoryError>;
 }
 
 #[async_trait]
 pub trait ExecutorRepository: Send + Sync {
     async fn upsert_executor(&self, executor: &Executor) -> Result<(), RepositoryError>;
     async fn record_heartbeat(&self, id: Uuid) -> Result<(), RepositoryError>;
+}
+
+#[async_trait]
+pub trait ArtifactRepository: Send + Sync {
+    async fn create_artifact_upload(
+        &self,
+        artifact: &Artifact,
+    ) -> Result<ArtifactUploadSession, RepositoryError>;
+    async fn get_artifact(&self, id: Uuid) -> Result<Option<Artifact>, RepositoryError>;
+    async fn get_upload_session(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<ArtifactUploadSession>, RepositoryError>;
+    async fn complete_artifact_upload(
+        &self,
+        session_id: Uuid,
+        object_key: &str,
+    ) -> Result<Artifact, RepositoryError>;
+}
+
+#[async_trait]
+pub trait PayloadRepository: Send + Sync {
+    async fn create_payload_upload(
+        &self,
+        payload: &PayloadObject,
+    ) -> Result<PayloadUploadSession, RepositoryError>;
+    async fn get_payload(&self, id: Uuid) -> Result<Option<PayloadObject>, RepositoryError>;
+    async fn get_upload_session(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<PayloadUploadSession>, RepositoryError>;
+    async fn complete_payload_upload(
+        &self,
+        session_id: Uuid,
+        object_key: &str,
+    ) -> Result<PayloadObject, RepositoryError>;
 }
 
 #[async_trait]

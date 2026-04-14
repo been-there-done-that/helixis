@@ -1,8 +1,12 @@
 use application::ports::repositories::TaskRepository;
 use cplane::app_router;
 use cplane::handlers::AppState;
+use cplane::live_logs::LiveLogHub;
+use cplane::storage::build_s3_store;
 use persistence::db;
+use persistence::repositories::artifact::PostgresArtifactRepository;
 use persistence::repositories::executor::PostgresExecutorRepository;
+use persistence::repositories::payload::PostgresPayloadRepository;
 use persistence::repositories::rate_limit::PostgresRateLimitRepository;
 use persistence::repositories::secret::PostgresSecretRepository;
 use persistence::repositories::task::PostgresTaskRepository;
@@ -18,17 +22,33 @@ async fn main() {
 
     let db_url = env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/helixis".into());
+    let s3_endpoint =
+        env::var("HELIXIS_S3_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".into());
+    let s3_access_key = env::var("HELIXIS_S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
+    let s3_secret_key = env::var("HELIXIS_S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
+    let output_bucket = env::var("HELIXIS_OUTPUT_BUCKET").unwrap_or_else(|_| "task-outputs".into());
+    let artifact_bucket =
+        env::var("HELIXIS_ARTIFACT_BUCKET").unwrap_or_else(|_| "artifacts".into());
 
     let pool = db::create_pool(&db_url)
         .await
         .expect("Failed to create postgres pool");
 
     let task_repo = Arc::new(PostgresTaskRepository::new(pool.clone()));
+    let artifact_repo = Arc::new(PostgresArtifactRepository::new(pool.clone()));
+    let payload_repo = Arc::new(PostgresPayloadRepository::new(pool.clone()));
     let executor_repo = Arc::new(PostgresExecutorRepository::new(pool.clone()));
     let rate_limit_repo = Arc::new(PostgresRateLimitRepository::new(pool.clone()));
     let secret_key = env::var("HELIXIS_SECRETS_KEY")
         .unwrap_or_else(|_| "dev-only-insecure-key-change-me".to_string());
     let secret_repo = Arc::new(PostgresSecretRepository::new(pool, &secret_key));
+    let output_store = build_s3_store(&s3_endpoint, &s3_access_key, &s3_secret_key, &output_bucket);
+    let artifact_store = build_s3_store(
+        &s3_endpoint,
+        &s3_access_key,
+        &s3_secret_key,
+        &artifact_bucket,
+    );
 
     let reconciler_repo = Arc::clone(&task_repo);
     tokio::spawn(async move {
@@ -45,9 +65,14 @@ async fn main() {
 
     let state = Arc::new(AppState {
         task_repo,
+        artifact_repo,
+        payload_repo,
         executor_repo,
         rate_limit_repo,
         secret_repo,
+        output_store,
+        artifact_store,
+        log_hub: Arc::new(LiveLogHub::new()),
     });
     let app = app_router(state);
 

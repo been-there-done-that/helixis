@@ -20,3 +20,6 @@ bytes = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
 telemetry = { path = "../../crates/telemetry" }
+runtime-core = { path = "../../crates/runtime/core" }
+runtime-python = { path = "../../crates/runtime/python" }
+runtime-node = { path = "../../crates/runtime/node" }

@@ -1,11 +1,16 @@
 use application::ports::repositories::{
-    ExecutorRepository, RateLimitRepository, SecretRepository, TaskRepository,
+    ArtifactRepository, ExecutorRepository, PayloadRepository, RateLimitRepository,
+    SecretRepository, TaskRepository,
 };
-use domain::{Executor, Task, TaskStatus};
+use domain::{
+    ArtifactStatus, ArtifactUploadStatus, Executor, PayloadStatus, PayloadUploadStatus, Task,
+    TaskStatus,
+};
 use persistence::{
     db,
     repositories::{
-        executor::PostgresExecutorRepository, rate_limit::PostgresRateLimitRepository,
+        artifact::PostgresArtifactRepository, executor::PostgresExecutorRepository,
+        payload::PostgresPayloadRepository, rate_limit::PostgresRateLimitRepository,
         secret::PostgresSecretRepository, task::PostgresTaskRepository,
     },
 };
@@ -48,10 +53,14 @@ async fn insert_prereqs(pool: &PgPool) -> (Uuid, Uuid, String) {
     .await
     .unwrap();
 
-    sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
-        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack_id
+    sqlx::query(
+        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes, status, object_key) VALUES ($1, $2, $3, $4, 'main.py', 100, 'Ready', $5)",
     )
+    .bind(artifact_id)
+    .bind(tenant_id)
+    .bind(Uuid::new_v4().to_string())
+    .bind(&runtime_pack_id)
+    .bind(format!("artifacts/{artifact_id}"))
     .execute(pool)
     .await
     .unwrap();
@@ -83,10 +92,12 @@ async fn test_insert_and_poll() {
         status: TaskStatus::Queued,
         priority: 10,
         rate_limit_key: None,
+        payload_ref: None,
         timeout_seconds: 300,
         max_attempts: 3,
         current_attempt: 0,
         idempotency_key: None,
+        payload_size_bytes: None,
     };
 
     task_repo.insert_task(&task).await.unwrap();
@@ -166,10 +177,12 @@ async fn test_requeue_expired_lease() {
         status: TaskStatus::Queued,
         priority: 1,
         rate_limit_key: None,
+        payload_ref: None,
         timeout_seconds: 60,
         max_attempts: 3,
         current_attempt: 0,
         idempotency_key: None,
+        payload_size_bytes: None,
     };
 
     task_repo.insert_task(&task).await.unwrap();
@@ -239,10 +252,12 @@ async fn test_stale_executor_cannot_poll() {
         status: TaskStatus::Queued,
         priority: 1,
         rate_limit_key: None,
+        payload_ref: None,
         timeout_seconds: 60,
         max_attempts: 3,
         current_attempt: 0,
         idempotency_key: None,
+        payload_size_bytes: None,
     };
 
     task_repo.insert_task(&task).await.unwrap();
@@ -288,10 +303,12 @@ async fn test_rate_limit_prevents_second_lease() {
             status: TaskStatus::Queued,
             priority: 1,
             rate_limit_key: Some("customer-123".to_string()),
+            payload_ref: None,
             timeout_seconds: 60,
             max_attempts: 3,
             current_attempt: 0,
             idempotency_key: None,
+            payload_size_bytes: None,
         };
 
         task_repo.insert_task(&task).await.unwrap();
@@ -323,4 +340,195 @@ async fn test_secret_round_trip() {
 
     let secrets = secret_repo.get_tenant_secrets(tenant_id).await.unwrap();
     assert_eq!(secrets.get("API_TOKEN"), Some(&"top-secret".to_string()));
+}
+
+#[tokio::test]
+async fn test_artifact_round_trip() {
+    let pool = setup_db().await;
+    let (tenant_id, _, runtime_pack_id) = insert_prereqs(&pool).await;
+    let artifact_repo = PostgresArtifactRepository::new(pool.clone());
+
+    let artifact = domain::Artifact {
+        id: Uuid::new_v4(),
+        tenant_id,
+        digest: format!("sha256:{}", Uuid::new_v4()),
+        runtime_pack_id,
+        entrypoint: "main.py".to_string(),
+        size_bytes: 42,
+        status: ArtifactStatus::PendingUpload,
+        object_key: None,
+    };
+
+    let session = artifact_repo
+        .create_artifact_upload(&artifact)
+        .await
+        .unwrap();
+    assert_eq!(session.status, ArtifactUploadStatus::Pending);
+
+    let fetched = artifact_repo
+        .get_artifact(artifact.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.status, ArtifactStatus::PendingUpload);
+    assert_eq!(fetched.digest, artifact.digest);
+
+    let completed = artifact_repo
+        .complete_artifact_upload(session.id, "artifacts/test")
+        .await
+        .unwrap();
+    assert_eq!(completed.status, ArtifactStatus::Ready);
+    assert_eq!(completed.object_key.as_deref(), Some("artifacts/test"));
+}
+
+#[tokio::test]
+async fn test_payload_round_trip() {
+    let pool = setup_db().await;
+    let (tenant_id, _, _) = insert_prereqs(&pool).await;
+    let payload_repo = PostgresPayloadRepository::new(pool.clone());
+
+    let payload = domain::PayloadObject {
+        id: Uuid::new_v4(),
+        tenant_id,
+        digest: format!("sha256:{}", Uuid::new_v4()),
+        size_bytes: 24,
+        status: PayloadStatus::PendingUpload,
+        object_key: None,
+    };
+
+    let session = payload_repo.create_payload_upload(&payload).await.unwrap();
+    assert_eq!(session.status, PayloadUploadStatus::Pending);
+
+    let fetched = payload_repo.get_payload(payload.id).await.unwrap().unwrap();
+    assert_eq!(fetched.status, PayloadStatus::PendingUpload);
+    assert_eq!(fetched.digest, payload.digest);
+
+    let completed = payload_repo
+        .complete_payload_upload(session.id, "payloads/test.json")
+        .await
+        .unwrap();
+    assert_eq!(completed.status, PayloadStatus::Ready);
+    assert_eq!(completed.object_key.as_deref(), Some("payloads/test.json"));
+}
+
+#[tokio::test]
+async fn test_get_task_outputs() {
+    let pool = setup_db().await;
+    let task_repo = PostgresTaskRepository::new(pool.clone());
+    let executor_repo = PostgresExecutorRepository::new(pool.clone());
+
+    let (tenant_id, artifact_id, runtime_pack_id) = insert_prereqs(&pool).await;
+    let executor = Executor {
+        id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+        capabilities: vec![runtime_pack_id.clone()],
+    };
+    executor_repo.upsert_executor(&executor).await.unwrap();
+
+    let task = Task {
+        id: Uuid::new_v4(),
+        tenant_id,
+        artifact_id,
+        runtime_pack_id: runtime_pack_id.clone(),
+        status: TaskStatus::Queued,
+        priority: 1,
+        rate_limit_key: None,
+        payload_ref: None,
+        timeout_seconds: 60,
+        max_attempts: 1,
+        current_attempt: 0,
+        idempotency_key: None,
+        payload_size_bytes: None,
+    };
+    task_repo.insert_task(&task).await.unwrap();
+
+    let (_polled, lease) = task_repo
+        .poll_and_lease(&runtime_pack_id, executor.id, 60)
+        .await
+        .unwrap()
+        .unwrap();
+
+    task_repo
+        .update_task_status(
+            task.id,
+            lease.id,
+            executor.id,
+            TaskStatus::Running,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    task_repo
+        .update_task_status(
+            task.id,
+            lease.id,
+            executor.id,
+            TaskStatus::TimedOut,
+            Some("tasks/test/logs.txt".to_string()),
+            Some("tasks/test/result.json".to_string()),
+            Some("timed out".to_string()),
+        )
+        .await
+        .unwrap();
+
+    let outputs = task_repo.get_task_outputs(task.id).await.unwrap().unwrap();
+    assert_eq!(outputs.status, TaskStatus::TimedOut);
+    assert_eq!(outputs.logs_ref.as_deref(), Some("tasks/test/logs.txt"));
+    assert_eq!(
+        outputs.result_ref.as_deref(),
+        Some("tasks/test/result.json")
+    );
+}
+
+#[tokio::test]
+async fn test_append_and_list_task_log_chunks() {
+    let pool = setup_db().await;
+    let task_repo = PostgresTaskRepository::new(pool.clone());
+    let executor_repo = PostgresExecutorRepository::new(pool.clone());
+
+    let (tenant_id, artifact_id, runtime_pack_id) = insert_prereqs(&pool).await;
+    let executor = Executor {
+        id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+        capabilities: vec![runtime_pack_id.clone()],
+    };
+    executor_repo.upsert_executor(&executor).await.unwrap();
+
+    let task = Task {
+        id: Uuid::new_v4(),
+        tenant_id,
+        artifact_id,
+        runtime_pack_id: runtime_pack_id.clone(),
+        status: TaskStatus::Queued,
+        priority: 1,
+        rate_limit_key: None,
+        payload_ref: None,
+        timeout_seconds: 60,
+        max_attempts: 1,
+        current_attempt: 0,
+        idempotency_key: None,
+        payload_size_bytes: None,
+    };
+    task_repo.insert_task(&task).await.unwrap();
+
+    let (_polled, lease) = task_repo
+        .poll_and_lease(&runtime_pack_id, executor.id, 60)
+        .await
+        .unwrap()
+        .unwrap();
+
+    task_repo
+        .append_task_log_chunk(task.id, lease.id, executor.id, "stdout", "hello")
+        .await
+        .unwrap();
+    task_repo
+        .append_task_log_chunk(task.id, lease.id, executor.id, "stderr", "world")
+        .await
+        .unwrap();
+
+    let chunks = task_repo.list_task_log_chunks(task.id).await.unwrap();
+    assert_eq!(chunks, vec!["[stdout] hello", "[stderr] world"]);
 }

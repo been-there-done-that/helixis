@@ -3,20 +3,26 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use cplane::{app_router, handlers::AppState};
+use cplane::{app_router, handlers::AppState, live_logs::LiveLogHub};
 use domain::{Executor, TaskStatus};
 use http_body_util::BodyExt;
+use object_store::ObjectStore;
+use object_store::memory::InMemory;
 use persistence::{
     db,
     repositories::{
-        executor::PostgresExecutorRepository, rate_limit::PostgresRateLimitRepository,
+        artifact::PostgresArtifactRepository, executor::PostgresExecutorRepository,
+        payload::PostgresPayloadRepository, rate_limit::PostgresRateLimitRepository,
         secret::PostgresSecretRepository, task::PostgresTaskRepository,
     },
 };
 use protocol::api::{
-    HeartbeatRequest, PollRequest, PollResponse, PutRateLimitRequest, PutSecretRequest,
-    RegisterExecutorRequest, TaskResponse, TaskStatusUpdateRequest, TaskSubmitRequest,
+    ArtifactResponse, ArtifactUploadCreateRequest, ArtifactUploadSessionResponse, HeartbeatRequest,
+    LiveLogChunkRequest, PayloadResponse, PayloadUploadCreateRequest, PayloadUploadSessionResponse,
+    PollRequest, PollResponse, PutRateLimitRequest, PutSecretRequest, RegisterExecutorRequest,
+    TaskResponse, TaskStatusUpdateRequest, TaskSubmitRequest,
 };
+use sha2::{Digest, Sha256};
 use std::env;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -62,13 +68,41 @@ async fn insert_prereqs(pool: &sqlx::PgPool) -> (Uuid, String) {
 fn build_state(pool: &sqlx::PgPool) -> Arc<AppState> {
     Arc::new(AppState {
         task_repo: Arc::new(PostgresTaskRepository::new(pool.clone())),
+        artifact_repo: Arc::new(PostgresArtifactRepository::new(pool.clone())),
+        payload_repo: Arc::new(PostgresPayloadRepository::new(pool.clone())),
         executor_repo: Arc::new(PostgresExecutorRepository::new(pool.clone())),
         rate_limit_repo: Arc::new(PostgresRateLimitRepository::new(pool.clone())),
         secret_repo: Arc::new(PostgresSecretRepository::new(
             pool.clone(),
             "test-secret-key",
         )),
+        output_store: Arc::new(InMemory::new()),
+        artifact_store: Arc::new(InMemory::new()),
+        log_hub: Arc::new(LiveLogHub::new()),
     })
+}
+
+async fn insert_ready_artifact(pool: &sqlx::PgPool, tenant_id: Uuid, runtime_pack: &str) -> Uuid {
+    let artifact_id = Uuid::new_v4();
+    let object_key = format!("artifacts/{artifact_id}");
+
+    sqlx::query(
+        r#"
+        INSERT INTO artifacts (
+            id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes, status, object_key
+        ) VALUES ($1, $2, $3, $4, 'main.py', 100, 'Ready', $5)
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(tenant_id)
+    .bind(Uuid::new_v4().to_string())
+    .bind(runtime_pack)
+    .bind(object_key)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    artifact_id
 }
 
 #[tokio::test]
@@ -76,15 +110,7 @@ async fn test_full_api_flow() {
     let pool = setup_db().await;
     let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
 
-    // We need an artifact
-    let artifact_id = Uuid::new_v4();
-    sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
-        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
 
     let state = build_state(&pool);
     let executor_repo = Arc::new(PostgresExecutorRepository::new(pool.clone()));
@@ -102,6 +128,8 @@ async fn test_full_api_flow() {
         tenant_id,
         artifact_id,
         runtime_pack_id: runtime_pack.clone(),
+        payload: None,
+        payload_upload_id: None,
         priority: Some(5),
         rate_limit_key: None,
         timeout_seconds: Some(100),
@@ -155,6 +183,7 @@ async fn test_full_api_flow() {
 
     assert!(body_json.task.is_some());
     assert!(body_json.environment.is_empty());
+    assert!(body_json.payload.is_none());
     let polled_task = body_json.task.unwrap();
     assert_eq!(polled_task.id, task_id);
     assert_eq!(polled_task.status, TaskStatus::Scheduled);
@@ -226,14 +255,7 @@ async fn test_reject_mismatched_artifact_runtime() {
     .await
     .unwrap();
 
-    let artifact_id = Uuid::new_v4();
-    sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
-        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
 
     let app = app_router(build_state(&pool));
 
@@ -241,6 +263,8 @@ async fn test_reject_mismatched_artifact_runtime() {
         tenant_id,
         artifact_id,
         runtime_pack_id: other_runtime_pack,
+        payload: None,
+        payload_upload_id: None,
         priority: Some(5),
         rate_limit_key: None,
         timeout_seconds: Some(100),
@@ -312,14 +336,7 @@ async fn test_cancel_endpoint_marks_task_cancelled() {
     let pool = setup_db().await;
     let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
 
-    let artifact_id = Uuid::new_v4();
-    sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
-        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
 
     let app = app_router(build_state(&pool));
 
@@ -327,6 +344,8 @@ async fn test_cancel_endpoint_marks_task_cancelled() {
         tenant_id,
         artifact_id,
         runtime_pack_id: runtime_pack,
+        payload: None,
+        payload_upload_id: None,
         priority: Some(1),
         rate_limit_key: None,
         timeout_seconds: Some(100),
@@ -384,15 +403,7 @@ async fn test_cancel_endpoint_marks_task_cancelled() {
 async fn test_poll_includes_tenant_secrets() {
     let pool = setup_db().await;
     let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
-    let artifact_id = Uuid::new_v4();
-
-    sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
-        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
 
     let app = app_router(build_state(&pool));
     let executor_id = Uuid::new_v4();
@@ -441,6 +452,8 @@ async fn test_poll_includes_tenant_secrets() {
         tenant_id,
         artifact_id,
         runtime_pack_id: runtime_pack.clone(),
+        payload: None,
+        payload_upload_id: None,
         priority: Some(1),
         rate_limit_key: None,
         timeout_seconds: Some(30),
@@ -493,15 +506,7 @@ async fn test_poll_includes_tenant_secrets() {
 async fn test_rate_limit_blocks_second_inflight_task() {
     let pool = setup_db().await;
     let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
-    let artifact_id = Uuid::new_v4();
-
-    sqlx::query!(
-        "INSERT INTO artifacts (id, tenant_id, digest, runtime_pack_id, entrypoint, size_bytes) VALUES ($1, $2, $3, $4, 'main.py', 100)",
-        artifact_id, tenant_id, Uuid::new_v4().to_string(), runtime_pack
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
 
     let app = app_router(build_state(&pool));
     let executor_id = Uuid::new_v4();
@@ -551,6 +556,8 @@ async fn test_rate_limit_blocks_second_inflight_task() {
             tenant_id,
             artifact_id,
             runtime_pack_id: runtime_pack.clone(),
+            payload: None,
+            payload_upload_id: None,
             priority: Some(1),
             rate_limit_key: Some("customer-123".to_string()),
             timeout_seconds: Some(30),
@@ -611,4 +618,634 @@ async fn test_rate_limit_blocks_second_inflight_task() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let second_poll: PollResponse = serde_json::from_slice(&body).unwrap();
     assert!(second_poll.task.is_none());
+}
+
+#[tokio::test]
+async fn test_register_and_get_artifact() {
+    let pool = setup_db().await;
+    let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
+    let app = app_router(build_state(&pool));
+
+    let request = ArtifactUploadCreateRequest {
+        tenant_id,
+        digest: format!("sha256:{}", Uuid::new_v4()),
+        runtime_pack_id: runtime_pack,
+        entrypoint: "main.py".to_string(),
+        size_bytes: 512,
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/artifact-uploads")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let artifact_response: ArtifactUploadSessionResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        artifact_response.artifact.status,
+        domain::ArtifactStatus::PendingUpload
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/v1/artifacts/{}", artifact_response.artifact.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_upload_artifact_content_stores_blob() {
+    let pool = setup_db().await;
+    let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
+    let artifact_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = Arc::new(AppState {
+        task_repo: Arc::new(PostgresTaskRepository::new(pool.clone())),
+        artifact_repo: Arc::new(PostgresArtifactRepository::new(pool.clone())),
+        payload_repo: Arc::new(PostgresPayloadRepository::new(pool.clone())),
+        executor_repo: Arc::new(PostgresExecutorRepository::new(pool.clone())),
+        rate_limit_repo: Arc::new(PostgresRateLimitRepository::new(pool.clone())),
+        secret_repo: Arc::new(PostgresSecretRepository::new(
+            pool.clone(),
+            "test-secret-key",
+        )),
+        output_store: Arc::new(InMemory::new()),
+        artifact_store: Arc::clone(&artifact_store),
+        log_hub: Arc::new(LiveLogHub::new()),
+    });
+    let app = app_router(state);
+
+    let artifact_bytes = format!("test-{}", Uuid::new_v4()).into_bytes();
+    let register = ArtifactUploadCreateRequest {
+        tenant_id,
+        digest: format!("sha256:{:x}", Sha256::digest(&artifact_bytes)),
+        runtime_pack_id: runtime_pack,
+        entrypoint: "main.py".to_string(),
+        size_bytes: artifact_bytes.len() as i64,
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/artifact-uploads")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&register).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let upload_response: ArtifactUploadSessionResponse = serde_json::from_slice(&body).unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/artifact-uploads/{}/content",
+                    upload_response.upload_session.id
+                ))
+                .body(Body::from(artifact_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let artifact_response: ArtifactResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        artifact_response.artifact.status,
+        domain::ArtifactStatus::Ready
+    );
+
+    let bytes = artifact_store
+        .get(&object_store::path::Path::from(format!(
+            "artifacts/{}",
+            artifact_response.artifact.id
+        )))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], artifact_bytes.as_slice());
+}
+
+#[tokio::test]
+async fn test_reject_task_submission_for_pending_artifact() {
+    let pool = setup_db().await;
+    let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
+    let app = app_router(build_state(&pool));
+
+    let request = ArtifactUploadCreateRequest {
+        tenant_id,
+        digest: format!("sha256:{}", Uuid::new_v4()),
+        runtime_pack_id: runtime_pack.clone(),
+        entrypoint: "main.py".to_string(),
+        size_bytes: 512,
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/artifact-uploads")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let upload_response: ArtifactUploadSessionResponse = serde_json::from_slice(&body).unwrap();
+
+    let submit_req = TaskSubmitRequest {
+        tenant_id,
+        artifact_id: upload_response.artifact.id,
+        runtime_pack_id: runtime_pack,
+        payload: None,
+        payload_upload_id: None,
+        priority: None,
+        rate_limit_key: None,
+        timeout_seconds: None,
+        max_attempts: None,
+        idempotency_key: None,
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&submit_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn test_payload_upload_stores_blob_and_can_be_submitted() {
+    let pool = setup_db().await;
+    let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
+    let output_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = Arc::new(AppState {
+        task_repo: Arc::new(PostgresTaskRepository::new(pool.clone())),
+        artifact_repo: Arc::new(PostgresArtifactRepository::new(pool.clone())),
+        payload_repo: Arc::new(PostgresPayloadRepository::new(pool.clone())),
+        executor_repo: Arc::new(PostgresExecutorRepository::new(pool.clone())),
+        rate_limit_repo: Arc::new(PostgresRateLimitRepository::new(pool.clone())),
+        secret_repo: Arc::new(PostgresSecretRepository::new(
+            pool.clone(),
+            "test-secret-key",
+        )),
+        output_store: output_store.clone(),
+        artifact_store: Arc::new(InMemory::new()),
+        log_hub: Arc::new(LiveLogHub::new()),
+    });
+    let app = app_router(state);
+
+    let payload_bytes = serde_json::to_vec(&serde_json::json!({
+        "hello": "world",
+        "nonce": Uuid::new_v4().to_string()
+    }))
+    .unwrap();
+    let create_request = PayloadUploadCreateRequest {
+        tenant_id,
+        digest: format!("sha256:{:x}", Sha256::digest(&payload_bytes)),
+        size_bytes: payload_bytes.len() as i64,
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/payload-uploads")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&create_request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let upload_response: PayloadUploadSessionResponse = serde_json::from_slice(&body).unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/payload-uploads/{}/content",
+                    upload_response.upload_session.id
+                ))
+                .body(Body::from(payload_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let payload_response: PayloadResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        payload_response.payload.status,
+        domain::PayloadStatus::Ready
+    );
+
+    let payload_blob = output_store
+        .get(&object_store::path::Path::from(format!(
+            "payloads/{}.json",
+            payload_response.payload.id
+        )))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&payload_blob[..], payload_bytes.as_slice());
+
+    let submit_req = TaskSubmitRequest {
+        tenant_id,
+        artifact_id,
+        runtime_pack_id: runtime_pack,
+        payload: None,
+        payload_upload_id: Some(payload_response.payload.id),
+        priority: Some(1),
+        rate_limit_key: None,
+        timeout_seconds: Some(30),
+        max_attempts: Some(1),
+        idempotency_key: None,
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&submit_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn test_task_output_retrieval_endpoints() {
+    let pool = setup_db().await;
+    let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
+    let output_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let state = Arc::new(AppState {
+        task_repo: Arc::new(PostgresTaskRepository::new(pool.clone())),
+        artifact_repo: Arc::new(PostgresArtifactRepository::new(pool.clone())),
+        payload_repo: Arc::new(PostgresPayloadRepository::new(pool.clone())),
+        executor_repo: Arc::new(PostgresExecutorRepository::new(pool.clone())),
+        rate_limit_repo: Arc::new(PostgresRateLimitRepository::new(pool.clone())),
+        secret_repo: Arc::new(PostgresSecretRepository::new(
+            pool.clone(),
+            "test-secret-key",
+        )),
+        output_store: output_store.clone(),
+        artifact_store: Arc::new(InMemory::new()),
+        log_hub: Arc::new(LiveLogHub::new()),
+    });
+    let app = app_router(state);
+
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
+
+    let executor_repo = Arc::new(PostgresExecutorRepository::new(pool.clone()));
+    let executor = Executor {
+        id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+        capabilities: vec![runtime_pack.clone()],
+    };
+    executor_repo.upsert_executor(&executor).await.unwrap();
+
+    let task_id = Uuid::new_v4();
+    sqlx::query!(
+        r#"
+        INSERT INTO tasks (
+            id, tenant_id, artifact_id, runtime_pack_id, status, timeout_seconds, max_attempts, current_attempt, result_ref
+        ) VALUES ($1, $2, $3, $4, 'Succeeded', 30, 1, 1, $5)
+        "#,
+        task_id,
+        tenant_id,
+        artifact_id,
+        runtime_pack,
+        "tasks/test/result.json"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query!(
+        r#"
+        INSERT INTO task_attempts (id, task_id, executor_id, lease_id, exit_reason, logs_ref)
+        VALUES ($1, $2, $3, $4, 'Succeeded', $5)
+        "#,
+        Uuid::new_v4(),
+        task_id,
+        executor.id,
+        Uuid::new_v4(),
+        "tasks/test/logs.txt"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    cplane::storage::put_bytes(&output_store, "tasks/test/logs.txt", b"hello logs".to_vec())
+        .await
+        .unwrap();
+    cplane::storage::put_bytes(
+        &output_store,
+        "tasks/test/result.json",
+        br#"{"ok":true}"#.to_vec(),
+    )
+    .await
+    .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/v1/tasks/{task_id}/logs"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"hello logs");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/v1/tasks/{task_id}/result"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], br#"{"ok":true}"#);
+}
+
+#[tokio::test]
+async fn test_poll_includes_offloaded_payload() {
+    let pool = setup_db().await;
+    let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
+
+    let app = app_router(build_state(&pool));
+    let executor_id = Uuid::new_v4();
+    let register_req = RegisterExecutorRequest {
+        executor_id,
+        session_id: Uuid::new_v4(),
+        capabilities: vec![runtime_pack.clone()],
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/executors/register")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&register_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let submit_req = TaskSubmitRequest {
+        tenant_id,
+        artifact_id,
+        runtime_pack_id: runtime_pack.clone(),
+        payload: Some(serde_json::json!({"message":"hello","n":1})),
+        payload_upload_id: None,
+        priority: Some(1),
+        rate_limit_key: None,
+        timeout_seconds: Some(30),
+        max_attempts: Some(1),
+        idempotency_key: None,
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&submit_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let poll_req = PollRequest {
+        runtime_pack_id: runtime_pack,
+        executor_id,
+        lease_duration_sec: 60,
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/executors/poll")
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&poll_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let poll: PollResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        poll.payload,
+        Some(serde_json::json!({"message":"hello","n":1}))
+    );
+}
+
+#[tokio::test]
+async fn test_append_live_log_publishes_to_hub() {
+    let pool = setup_db().await;
+    let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
+    let task_id = Uuid::new_v4();
+
+    let state = build_state(&pool);
+    let mut receiver = state.log_hub.subscribe(task_id).await;
+    let app = app_router(Arc::clone(&state));
+    let executor_repo = PostgresExecutorRepository::new(pool.clone());
+    let executor = Executor {
+        id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+        capabilities: vec!["python-3.11".to_string()],
+    };
+    executor_repo.upsert_executor(&executor).await.unwrap();
+
+    sqlx::query!(
+        r#"
+        INSERT INTO tasks (
+            id, tenant_id, artifact_id, runtime_pack_id, status, timeout_seconds, max_attempts, current_attempt
+        ) VALUES ($1, $2, $3, $4, 'Running', 30, 1, 1)
+        "#,
+        task_id,
+        tenant_id,
+        artifact_id,
+        runtime_pack
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let lease_id = Uuid::new_v4();
+    sqlx::query!(
+        "INSERT INTO task_leases (id, task_id, executor_id, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '1 minute')",
+        lease_id,
+        task_id,
+        executor.id
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let request = LiveLogChunkRequest {
+        lease_id,
+        executor_id: executor.id,
+        stream: "stdout".to_string(),
+        chunk: "stream line".to_string(),
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/tasks/{}/logs/append", task_id))
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let received = receiver.recv().await.unwrap();
+    assert_eq!(received, "[stdout] stream line");
+}
+
+#[tokio::test]
+async fn test_get_logs_replays_persisted_chunks() {
+    let pool = setup_db().await;
+    let (tenant_id, runtime_pack) = insert_prereqs(&pool).await;
+    let artifact_id = insert_ready_artifact(&pool, tenant_id, &runtime_pack).await;
+
+    let state = build_state(&pool);
+    let app = app_router(Arc::clone(&state));
+
+    let executor = Executor {
+        id: Uuid::new_v4(),
+        session_id: Uuid::new_v4(),
+        capabilities: vec![runtime_pack.clone()],
+    };
+    let executor_repo = PostgresExecutorRepository::new(pool.clone());
+    executor_repo.upsert_executor(&executor).await.unwrap();
+
+    let task_id = Uuid::new_v4();
+    sqlx::query!(
+        r#"
+        INSERT INTO tasks (
+            id, tenant_id, artifact_id, runtime_pack_id, status, timeout_seconds, max_attempts, current_attempt
+        ) VALUES ($1, $2, $3, $4, 'Running', 30, 1, 1)
+        "#,
+        task_id,
+        tenant_id,
+        artifact_id,
+        runtime_pack
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let lease_id = Uuid::new_v4();
+    sqlx::query!(
+        "INSERT INTO task_leases (id, task_id, executor_id, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '1 minute')",
+        lease_id,
+        task_id,
+        executor.id
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let request = LiveLogChunkRequest {
+        lease_id,
+        executor_id: executor.id,
+        stream: "stdout".to_string(),
+        chunk: "replay me".to_string(),
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/tasks/{task_id}/logs/append"))
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_string(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/v1/tasks/{task_id}/logs"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"[stdout] replay me");
 }

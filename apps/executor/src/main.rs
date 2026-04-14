@@ -1,14 +1,28 @@
 mod artifact_client;
 mod client;
+mod output_store;
 mod sandbox;
 
 use artifact_client::ArtifactDownloader;
 use client::CplaneClient;
+use output_store::OutputUploader;
+use runtime_core::RuntimeAdapter;
+use runtime_node::NodeRuntimeAdapter;
+use runtime_python::PythonRuntimeAdapter;
 use sandbox::{ProcessSandbox, TaskSandbox};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
+
+fn runtime_adapter_for(runtime_pack_id: &str, default_command: String) -> Box<dyn RuntimeAdapter> {
+    if runtime_pack_id.starts_with("node") {
+        let binary = std::env::var("NODE_EXECUTOR_COMMAND").unwrap_or_else(|_| "node".to_string());
+        Box::new(NodeRuntimeAdapter::new(binary))
+    } else {
+        Box::new(PythonRuntimeAdapter::new(default_command))
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -24,24 +38,40 @@ async fn main() {
             .expect("Failed to create unified Control Plane internal client"),
     );
 
-    let downloader = ArtifactDownloader::new(
-        "http://localhost:9000",
-        "minioadmin",
-        "minioadmin",
-        "artifacts",
-    );
+    let s3_endpoint =
+        std::env::var("HELIXIS_S3_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".into());
+    let s3_access_key =
+        std::env::var("HELIXIS_S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into());
+    let s3_secret_key =
+        std::env::var("HELIXIS_S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into());
+    let artifact_bucket =
+        std::env::var("HELIXIS_ARTIFACT_BUCKET").unwrap_or_else(|_| "artifacts".into());
+    let output_bucket =
+        std::env::var("HELIXIS_OUTPUT_BUCKET").unwrap_or_else(|_| "task-outputs".into());
 
-    let command = std::env::var("EXECUTOR_COMMAND").unwrap_or_else(|_| "python3".to_string());
-    let entrypoint = std::env::var("EXECUTOR_ENTRYPOINT").unwrap_or_else(|_| "main.py".to_string());
-    let sandbox = ProcessSandbox {
-        downloader,
-        command,
-        entrypoint,
-    };
+    let downloader = ArtifactDownloader::new(
+        &s3_endpoint,
+        &s3_access_key,
+        &s3_secret_key,
+        &artifact_bucket,
+    );
+    let output_uploader = OutputUploader::new(
+        &s3_endpoint,
+        &s3_access_key,
+        &s3_secret_key,
+        &output_bucket,
+        "tasks",
+    );
 
     let env_pack_id =
         std::env::var("RUNTIME_PACK_ID").unwrap_or_else(|_| "demo-python-pack".to_string());
     let runtime_pack_id = env_pack_id.clone();
+    let command = std::env::var("EXECUTOR_COMMAND").unwrap_or_else(|_| "python3".to_string());
+    let sandbox = ProcessSandbox {
+        downloader,
+        output_uploader,
+        runtime: runtime_adapter_for(&runtime_pack_id, command),
+    };
 
     client
         .register_executor(vec![runtime_pack_id.clone()])
@@ -69,7 +99,7 @@ async fn main() {
         tracing::debug!("Polling queue...");
 
         match client.poll_task(&runtime_pack_id, 120).await {
-            Ok(Some((task, lease, environment))) => {
+            Ok(Some((task, lease, artifact, environment, payload))) => {
                 consecutive_empty_polls = 0;
                 tracing::info!("Acquired task {}! Executing now...", task.id);
 
@@ -84,7 +114,14 @@ async fn main() {
 
                 // Execute mock task
                 match sandbox
-                    .execute(&task, &lease, Arc::clone(&client), environment)
+                    .execute(
+                        &task,
+                        &lease,
+                        &artifact,
+                        Arc::clone(&client),
+                        environment,
+                        payload,
+                    )
                     .await
                 {
                     Ok(outcome) => {

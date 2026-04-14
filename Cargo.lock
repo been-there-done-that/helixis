@@ -308,13 +308,16 @@ dependencies = [
  "dotenvy",
  "http-body-util",
  "hyper",
+ "object_store",
  "persistence",
  "protocol",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "telemetry",
  "tokio",
+ "tokio-stream",
  "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
@@ -513,6 +516,9 @@ dependencies = [
  "object_store",
  "protocol",
  "reqwest",
+ "runtime-core",
+ "runtime-node",
+ "runtime-python",
  "serde",
  "serde_json",
  "tar",
@@ -1652,6 +1658,7 @@ version = "0.1.0"
 dependencies = [
  "domain",
  "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -1897,6 +1904,32 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "runtime-core"
+version = "0.1.0"
+dependencies = [
+ "domain",
+ "tokio",
+]
+
+[[package]]
+name = "runtime-node"
+version = "0.1.0"
+dependencies = [
+ "domain",
+ "runtime-core",
+ "tokio",
+]
+
+[[package]]
+name = "runtime-python"
+version = "0.1.0"
+dependencies = [
+ "domain",
+ "runtime-core",
+ "tokio",
 ]
 
 [[package]]
@@ -2670,6 +2703,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

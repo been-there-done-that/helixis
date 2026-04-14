@@ -1,0 +1,9 @@
+[package]
+name = "runtime-python"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+domain = { path = "../../../crates/domain" }
+runtime-core = { path = "../core" }

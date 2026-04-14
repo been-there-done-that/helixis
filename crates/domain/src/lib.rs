@@ -22,10 +22,12 @@ pub struct Task {
     pub status: TaskStatus,
     pub priority: i32,
     pub rate_limit_key: Option<String>,
+    pub payload_ref: Option<String>,
     pub timeout_seconds: i32,
     pub max_attempts: i32,
     pub current_attempt: i32,
     pub idempotency_key: Option<String>,
+    pub payload_size_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +38,12 @@ pub struct RuntimePack {
     pub sandbox_kind: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ArtifactStatus {
+    PendingUpload,
+    Ready,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
     pub id: Uuid,
@@ -44,6 +52,58 @@ pub struct Artifact {
     pub runtime_pack_id: String,
     pub entrypoint: String,
     pub size_bytes: i64,
+    pub status: ArtifactStatus,
+    pub object_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ArtifactUploadStatus {
+    Pending,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactUploadSession {
+    pub id: Uuid,
+    pub artifact_id: Uuid,
+    pub status: ArtifactUploadStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PayloadStatus {
+    PendingUpload,
+    Ready,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PayloadObject {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub digest: String,
+    pub size_bytes: i64,
+    pub status: PayloadStatus,
+    pub object_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PayloadUploadStatus {
+    Pending,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PayloadUploadSession {
+    pub id: Uuid,
+    pub payload_id: Uuid,
+    pub status: PayloadUploadStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskOutputs {
+    pub task_id: Uuid,
+    pub status: TaskStatus,
+    pub logs_ref: Option<String>,
+    pub result_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 
-use domain::{Task, TaskLease};
+use domain::{
+    Artifact, ArtifactUploadSession, PayloadObject, PayloadUploadSession, Task, TaskLease,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -9,6 +12,8 @@ pub struct TaskSubmitRequest {
     pub tenant_id: Uuid,
     pub artifact_id: Uuid,
     pub runtime_pack_id: String,
+    pub payload: Option<Value>,
+    pub payload_upload_id: Option<Uuid>,
     pub priority: Option<i32>,
     pub rate_limit_key: Option<String>,
     pub timeout_seconds: Option<i32>,
@@ -23,6 +28,44 @@ pub struct TaskResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ArtifactUploadCreateRequest {
+    pub tenant_id: Uuid,
+    pub digest: String,
+    pub runtime_pack_id: String,
+    pub entrypoint: String,
+    pub size_bytes: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ArtifactResponse {
+    pub artifact: Artifact,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ArtifactUploadSessionResponse {
+    pub artifact: Artifact,
+    pub upload_session: ArtifactUploadSession,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PayloadUploadCreateRequest {
+    pub tenant_id: Uuid,
+    pub digest: String,
+    pub size_bytes: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PayloadResponse {
+    pub payload: PayloadObject,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PayloadUploadSessionResponse {
+    pub payload: PayloadObject,
+    pub upload_session: PayloadUploadSession,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PollRequest {
     pub runtime_pack_id: String,
     pub executor_id: Uuid,
@@ -33,7 +76,9 @@ pub struct PollRequest {
 pub struct PollResponse {
     pub task: Option<Task>,
     pub lease: Option<TaskLease>,
+    pub artifact: Option<Artifact>,
     pub environment: BTreeMap<String, String>,
+    pub payload: Option<Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -70,4 +115,12 @@ pub struct PutSecretRequest {
     pub tenant_id: Uuid,
     pub key: String,
     pub value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LiveLogChunkRequest {
+    pub lease_id: Uuid,
+    pub executor_id: Uuid,
+    pub stream: String,
+    pub chunk: String,
 }
