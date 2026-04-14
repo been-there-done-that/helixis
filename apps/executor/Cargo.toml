@@ -1,0 +1,22 @@
+[package]
+name = "executor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+protocol = { path = "../../crates/protocol" }
+domain = { path = "../../crates/domain" }
+reqwest = { version = "0.12", features = ["json"] }
+thiserror = { workspace = true }
+async-trait = "0.1"
+object_store = { workspace = true }
+bytes = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+telemetry = { path = "../../crates/telemetry" }
